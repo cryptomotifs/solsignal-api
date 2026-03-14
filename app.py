@@ -240,6 +240,13 @@ async def root():
         },
         "auth": ["x402 (USDC on Solana)", "API key (X-API-Key header)"],
         "x402_enabled": bool(SOLANA_WALLET),
+        "token": {
+            "name": "Sol Signal AI",
+            "symbol": "SSAI",
+            "mint": "4KQnaEvCWp315CrVTvjUG7osfj2uAVCMpT5GhRQ7pump",
+            "platform": "pump.fun",
+            "url": "https://pump.fun/coin/4KQnaEvCWp315CrVTvjUG7osfj2uAVCMpT5GhRQ7pump",
+        },
         "docs": "/docs",
     }
 
