@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy API code and data
 COPY app.py .
 COPY scoring.py .
+COPY scanner.py .
+COPY tracker.py .
 COPY data/ data/
 
 EXPOSE 8402

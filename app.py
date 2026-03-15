@@ -1,7 +1,11 @@
-"""SolSignal API — Arena-calibrated trading signals from 646 AI agents.
+"""SolSignal API — Token Safety Scanner + Arena-calibrated trading signals.
 
 Standalone deployment version. No dependencies on the full bot codebase.
-Reads pre-computed data from JSON/SQLite files in the data/ directory.
+
+Primary product: /scan/{mint} — aggregates 4 free security sources (DexScreener,
+RugCheck, GoPlus, Jupiter) into a single SAFE/CAUTION/AVOID/RUG verdict in <2s.
+
+Legacy: /signals/* endpoints — 646 AI agent scoring (experimental).
 
 Deployment:
     Render.com, Railway.app, Fly.io, or any Docker host.
@@ -9,12 +13,14 @@ Deployment:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
 import secrets
 import sqlite3
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,23 +40,93 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
 PRICES = {
+    "scan": 10000,           # $0.01
     "trending": 10000,       # $0.01
     "agent": 5000,           # $0.005
     "analysis": 50000,       # $0.05
     "bulk": 100000,          # $0.10
 }
 
+# --- Free tier rate limiting ---
+# IP -> {date_str: count}
+_free_tier_usage: dict[str, dict[str, int]] = {}
+FREE_SCAN_DAILY = 10
+FREE_TRENDING_DAILY = 3
+
+
+def _check_free_tier(ip: str, endpoint: str) -> bool:
+    """Check if IP has free tier quota remaining. Returns True if allowed."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = f"{ip}:{endpoint}"
+
+    if key not in _free_tier_usage:
+        _free_tier_usage[key] = {}
+
+    usage = _free_tier_usage[key]
+
+    # Clean old dates
+    old_keys = [d for d in usage if d != today]
+    for k in old_keys:
+        del usage[k]
+
+    limit = FREE_SCAN_DAILY if endpoint == "scan" else FREE_TRENDING_DAILY
+    current = usage.get(today, 0)
+    return current < limit
+
+
+def _record_free_usage(ip: str, endpoint: str):
+    """Record a free tier usage."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = f"{ip}:{endpoint}"
+    if key not in _free_tier_usage:
+        _free_tier_usage[key] = {}
+    _free_tier_usage[key][today] = _free_tier_usage[key].get(today, 0) + 1
+
+
+# --- Background task ---
+_background_tasks: set[asyncio.Task] = set()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle — starts background outcome backfiller."""
+    task = asyncio.create_task(_outcome_backfill_loop())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _outcome_backfill_loop():
+    """Run outcome backfill every 30 minutes."""
+    from tracker import backfill_outcomes
+    while True:
+        try:
+            await asyncio.sleep(1800)  # 30 min
+            await backfill_outcomes()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
 # --- App ---
 app = FastAPI(
     title="SolSignal API",
     description=(
-        "Arena-calibrated trading signals from 646 AI agents. "
-        "Each agent tested against 18,000+ real Solana token snapshots. "
+        "Solana Token Safety Scanner — aggregates DexScreener, RugCheck, GoPlus, "
+        "and Jupiter simulation into a single SAFE/CAUTION/AVOID/RUG verdict. "
+        "Plus experimental 646-agent scoring. "
         "Pay per request via x402 (USDC on Solana) or API key."
     ),
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -208,6 +284,30 @@ async def _gate(request: Request, resource: str, price_key: str) -> Response | N
     return _build_402(resource, price_key)
 
 
+async def _gate_or_free(request: Request, resource: str, price_key: str, free_endpoint: str) -> Response | None:
+    """Like _gate, but allows free tier by IP first."""
+    # Check API key / x402 first
+    api_key = request.headers.get("x-api-key")
+    if _check_api_key(api_key):
+        _deduct_credit(api_key)
+        _log_revenue(resource, PRICES.get(price_key, 10000) / 1_000_000, "api_key")
+        return None
+
+    payment = request.headers.get("payment-signature") or request.headers.get("x-payment")
+    if payment:
+        if await _verify_x402(payment, resource, price_key):
+            _log_revenue(resource, PRICES.get(price_key, 10000) / 1_000_000, "x402")
+            return None
+
+    # Free tier check by IP
+    ip = request.client.host if request.client else "unknown"
+    if _check_free_tier(ip, free_endpoint):
+        _record_free_usage(ip, free_endpoint)
+        return None
+
+    return _build_402(resource, price_key)
+
+
 # --- Data queries ---
 
 def _query_db(db_path: str, sql: str, params: tuple = ()) -> list[dict]:
@@ -220,27 +320,44 @@ def _query_db(db_path: str, sql: str, params: tuple = ()) -> list[dict]:
     return rows
 
 
-# --- Endpoints ---
+# =========================================================================
+# PRIMARY ENDPOINTS — Token Safety Scanner
+# =========================================================================
 
 @app.get("/")
 async def root():
     configs = _load_boost_configs()
     return {
         "name": "SolSignal API",
-        "tagline": "646 AI agents. 18,000+ snapshots. Arena-calibrated precision.",
-        "version": "1.0.0",
-        "agents": len(configs),
+        "tagline": "Solana Token Safety Scanner — 4 sources, 1 verdict, <2 seconds.",
+        "version": "2.0.0",
         "endpoints": {
-            "/health": "Free - System status",
-            "/agents": "Free - All agents with precision stats",
-            "/signals/live/{mint}": "$0.05 - REAL-TIME scoring of ANY Solana token",
-            "/signals/trending": "$0.01 - Top tier1 picks from best agents",
-            "/signals/agent/{name}": "$0.005 - Specific agent's scores",
-            "/signals/analysis/{mint}": "$0.05 - Full multi-agent token consensus (historical)",
-            "/signals/bulk": "$0.10 - All scores for all recent tokens",
+            "## Safety Scanner (PRIMARY)": "---",
+            "/scan/{mint}": "Scan ANY Solana token — SAFE/CAUTION/AVOID/RUG verdict (10 free/day)",
+            "/trending": "Safety-screened trending tokens (3 free/day)",
+            "/track/stats": "Free — Public accuracy track record",
+            "/track/{mint}": "Free — Scan history for a specific token",
+            "## Legacy Signals (experimental)": "---",
+            "/signals/live/{mint}": "$0.05 — 646-agent scoring (experimental, use /scan for safety)",
+            "/signals/trending": "$0.01 — Top tier1 picks from best agents",
+            "/signals/agent/{name}": "$0.005 — Specific agent's scores",
+            "/signals/analysis/{mint}": "$0.05 — Full multi-agent consensus (historical)",
+            "/signals/bulk": "$0.10 — All scores for all recent tokens",
+            "## System": "---",
+            "/health": "Free — System status",
+            "/agents": "Free — All agents with precision stats",
+            "/docs": "Interactive API docs",
         },
-        "auth": ["x402 (USDC on Solana)", "API key (X-API-Key header)"],
+        "pricing": {
+            "free": "10 scans/day + 3 trending/day (by IP)",
+            "developer": "$9/month — 1000 scans/month",
+            "pro": "$29/month — 5000 scans/month",
+            "x402": "$0.01/scan (USDC on Solana)",
+        },
+        "auth": ["Free tier (IP)", "API key (X-API-Key header)", "x402 (USDC on Solana)"],
         "x402_enabled": bool(SOLANA_WALLET),
+        "sources": ["DexScreener", "RugCheck", "GoPlus", "Jupiter Simulation"],
+        "agents": len(configs),
         "token": {
             "name": "Sol Signal AI",
             "symbol": "SSAI",
@@ -252,6 +369,77 @@ async def root():
     }
 
 
+@app.get("/scan/{mint}")
+async def scan(request: Request, mint: str):
+    """Scan a Solana token for safety — aggregates 4 sources into one verdict.
+
+    Sources: DexScreener (market data), RugCheck (LP/holders), GoPlus (honeypot/tax),
+    Jupiter (buy+sell simulation). All fetched in parallel.
+
+    Free tier: 10 scans/day per IP. Also accepts API key or x402 payment.
+    """
+    block = await _gate_or_free(request, f"/scan/{mint}", "scan", "scan")
+    if block:
+        return block
+
+    from scanner import scan_token
+    from tracker import record_scan
+
+    result = await scan_token(mint)
+
+    # Record in tracker (non-blocking, ignore errors)
+    if "error" not in result:
+        try:
+            record_scan(
+                mint=mint,
+                symbol=result.get("symbol", "???"),
+                verdict=result["verdict"],
+                safety_score=result["safety_score"],
+                price=result.get("price_usd", 0) or 0,
+            )
+        except Exception:
+            pass
+
+    return result
+
+
+@app.get("/trending")
+async def trending_safety(request: Request, limit: int = 20):
+    """Safety-screened trending tokens — fetches DexScreener trending + scans each.
+
+    Free tier: 3 calls/day per IP. Also accepts API key or x402 payment.
+    """
+    block = await _gate_or_free(request, "/trending", "trending", "trending")
+    if block:
+        return block
+
+    from scanner import scan_trending
+
+    return await scan_trending(limit=min(limit, 30))
+
+
+@app.get("/track/stats")
+async def track_stats():
+    """Public accuracy track record — shows how our verdicts perform over time.
+
+    Every /scan call is recorded. Background job checks prices 1h/24h later.
+    This endpoint shows aggregate accuracy: "X% of tokens we said AVOID lost >20% in 24h."
+    """
+    from tracker import get_stats
+    return get_stats()
+
+
+@app.get("/track/{mint}")
+async def track_token(mint: str):
+    """Scan history for a specific token — all past scans with outcomes."""
+    from tracker import get_token_history
+    return get_token_history(mint)
+
+
+# =========================================================================
+# SYSTEM ENDPOINTS
+# =========================================================================
+
 @app.get("/health")
 async def health():
     configs = _load_boost_configs()
@@ -259,8 +447,21 @@ async def health():
     if os.path.exists(ARENA_DB):
         rows = _query_db(ARENA_DB, "SELECT COUNT(*) as cnt FROM snapshots")
         snap_count = rows[0]["cnt"] if rows else 0
+
+    from tracker import get_stats
+    try:
+        stats = get_stats()
+        total_scans = stats.get("total_scans", 0)
+    except Exception:
+        total_scans = 0
+
     return {
         "status": "healthy",
+        "version": "2.0.0",
+        "scanner": {
+            "total_scans": total_scans,
+            "sources": ["dexscreener", "rugcheck", "goplus", "jupiter_sim"],
+        },
         "agents": len(configs),
         "snapshots": snap_count,
         "x402": bool(SOLANA_WALLET),
@@ -279,6 +480,20 @@ async def list_agents():
     )
     return {"total": len(agents), "agents": agents}
 
+
+@app.get("/revenue")
+async def revenue():
+    total = sum(r["amount_usdc"] for r in _revenue_log)
+    by_ep = {}
+    for r in _revenue_log:
+        by_ep[r["endpoint"]] = by_ep.get(r["endpoint"], 0) + r["amount_usdc"]
+    return {"total_usdc": round(total, 4), "calls": len(_revenue_log),
+            "by_endpoint": by_ep, "recent": _revenue_log[-10:]}
+
+
+# =========================================================================
+# LEGACY SIGNAL ENDPOINTS (experimental — kept for backwards compatibility)
+# =========================================================================
 
 @app.get("/signals/trending")
 async def trending(request: Request, limit: int = 20):
@@ -377,7 +592,10 @@ async def bulk(request: Request):
 
 @app.get("/signals/live/{mint}")
 async def live_score(request: Request, mint: str, top_n: int = 20):
-    """Score ANY Solana token in real-time against all 646 calibrated agents."""
+    """Score ANY Solana token in real-time against all 646 calibrated agents.
+
+    NOTE: Experimental. For safety screening, use /scan/{mint} instead.
+    """
     block = await _gate(request, f"/signals/live/{mint}", "analysis")
     if block:
         return block
@@ -431,21 +649,14 @@ async def live_score(request: Request, mint: str, top_n: int = 20):
         "top_bearish_agents": top_bearish,
         "risk_flags": risk_flags,
         "metrics_computed": len(derived),
+        "note": "Experimental — for safety screening, use /scan/{mint} instead.",
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-@app.get("/revenue")
-async def revenue():
-    total = sum(r["amount_usdc"] for r in _revenue_log)
-    by_ep = {}
-    for r in _revenue_log:
-        by_ep[r["endpoint"]] = by_ep.get(r["endpoint"], 0) + r["amount_usdc"]
-    return {"total_usdc": round(total, 4), "calls": len(_revenue_log),
-            "by_endpoint": by_ep, "recent": _revenue_log[-10:]}
-
-
-# --- Auto-discovery endpoints ---
+# =========================================================================
+# AUTO-DISCOVERY ENDPOINTS
+# =========================================================================
 
 @app.get("/.well-known/x402.json")
 async def x402_manifest():
@@ -453,7 +664,11 @@ async def x402_manifest():
     return {
         "x402Version": 2,
         "name": "SolSignal API",
-        "description": "Arena-calibrated trading signals from 646 AI agents tested against 20,000+ real Solana token snapshots.",
+        "description": (
+            "Solana Token Safety Scanner — aggregates DexScreener, RugCheck, GoPlus, "
+            "and Jupiter simulation into one SAFE/CAUTION/AVOID/RUG verdict in <2 seconds. "
+            "Plus experimental 646-agent scoring."
+        ),
         "homepage": "https://github.com/cryptomotifs/solsignal-api",
         "network": SOLANA_NETWORK,
         "asset": USDC_MINT,
@@ -461,9 +676,25 @@ async def x402_manifest():
         "facilitator": X402_FACILITATOR,
         "endpoints": [
             {
+                "path": "/scan/{mint}",
+                "method": "GET",
+                "description": "Token safety scan — 4 sources, 1 verdict (10 free/day)",
+                "maxAmountRequired": str(PRICES["scan"]),
+                "currency": "USDC",
+                "priceUsd": "$0.01",
+            },
+            {
+                "path": "/trending",
+                "method": "GET",
+                "description": "Safety-screened trending Solana tokens (3 free/day)",
+                "maxAmountRequired": str(PRICES["trending"]),
+                "currency": "USDC",
+                "priceUsd": "$0.01",
+            },
+            {
                 "path": "/signals/live/{mint}",
                 "method": "GET",
-                "description": "Real-time scoring of ANY Solana token through 646 calibrated agents",
+                "description": "Experimental: Real-time 646-agent scoring",
                 "maxAmountRequired": str(PRICES["analysis"]),
                 "currency": "USDC",
                 "priceUsd": "$0.05",
@@ -471,7 +702,7 @@ async def x402_manifest():
             {
                 "path": "/signals/trending",
                 "method": "GET",
-                "description": "Top-performing agents and latest token snapshots",
+                "description": "Legacy: Top-performing agents and latest snapshots",
                 "maxAmountRequired": str(PRICES["trending"]),
                 "currency": "USDC",
                 "priceUsd": "$0.01",
@@ -479,7 +710,7 @@ async def x402_manifest():
             {
                 "path": "/signals/agent/{agent_name}",
                 "method": "GET",
-                "description": "Scores from a specific calibrated agent",
+                "description": "Legacy: Scores from a specific calibrated agent",
                 "maxAmountRequired": str(PRICES["agent"]),
                 "currency": "USDC",
                 "priceUsd": "$0.005",
@@ -487,7 +718,7 @@ async def x402_manifest():
             {
                 "path": "/signals/analysis/{mint}",
                 "method": "GET",
-                "description": "Full multi-agent consensus analysis for a token",
+                "description": "Legacy: Full multi-agent consensus analysis",
                 "maxAmountRequired": str(PRICES["analysis"]),
                 "currency": "USDC",
                 "priceUsd": "$0.05",
@@ -495,13 +726,13 @@ async def x402_manifest():
             {
                 "path": "/signals/bulk",
                 "method": "GET",
-                "description": "All scores from top 50 agents for recent tokens",
+                "description": "Legacy: All scores from top 50 agents for recent tokens",
                 "maxAmountRequired": str(PRICES["bulk"]),
                 "currency": "USDC",
                 "priceUsd": "$0.10",
             },
         ],
-        "freeEndpoints": ["/", "/health", "/agents", "/docs"],
+        "freeEndpoints": ["/", "/health", "/agents", "/track/stats", "/track/{mint}", "/docs"],
         "token": {
             "name": "Sol Signal AI",
             "symbol": "SSAI",
@@ -517,12 +748,18 @@ async def ai_plugin():
         "schema_version": "v1",
         "name_for_human": "SolSignal",
         "name_for_model": "solsignal",
-        "description_for_human": "Arena-calibrated Solana trading signals from 646 AI agents.",
+        "description_for_human": (
+            "Solana Token Safety Scanner — scan any token for honeypots, rug pulls, "
+            "and scams. Plus experimental 646-agent trading signals."
+        ),
         "description_for_model": (
-            "Provides Solana token trading signals from 646 AI agents, each tested against "
-            "20,000+ real market snapshots. Returns agent precision scores, tier1 picks, "
-            "multi-agent consensus analysis, and token price/volume/liquidity data. "
-            "Accepts x402 USDC payments on Solana or API key authentication."
+            "Solana token safety scanner. /scan/{mint} aggregates 4 free security sources "
+            "(DexScreener, RugCheck, GoPlus, Jupiter simulation) into a single "
+            "SAFE/CAUTION/AVOID/RUG verdict in under 2 seconds. Returns safety_score (0-100), "
+            "individual checks (honeypot, sell_tax, lp_locked, mintable, holder_concentration, "
+            "liquidity, age), and risk_flags. /trending returns safety-screened trending tokens. "
+            "/track/stats shows public accuracy record. Free tier: 10 scans/day. "
+            "Also supports x402 USDC payments and API key auth."
         ),
         "auth": {"type": "none"},
         "api": {
@@ -540,15 +777,27 @@ async def agent_manifest():
     """Solana Agent Protocol discovery — for agent-to-agent communication."""
     return {
         "name": "SolSignal",
-        "description": "646 AI agents providing arena-calibrated Solana trading signals",
+        "description": (
+            "Solana Token Safety Scanner — aggregates 4 sources into one verdict. "
+            "Plus 646 AI agents providing experimental trading signals."
+        ),
         "url": "https://solsignal-api.onrender.com",
         "documentationUrl": "https://solsignal-api.onrender.com/docs",
-        "capabilities": ["trading-signals", "token-analysis", "agent-scores"],
+        "capabilities": [
+            "token-safety-scan",
+            "honeypot-detection",
+            "rug-detection",
+            "trending-tokens",
+            "accuracy-tracking",
+            "trading-signals",
+            "token-analysis",
+            "agent-scores",
+        ],
         "payment": {
             "protocol": "x402",
             "network": "solana",
             "asset": "USDC",
             "facilitator": X402_FACILITATOR,
         },
-        "version": "1.0.0",
+        "version": "2.0.0",
     }
