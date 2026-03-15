@@ -382,3 +382,104 @@ async def revenue():
         by_ep[r["endpoint"]] = by_ep.get(r["endpoint"], 0) + r["amount_usdc"]
     return {"total_usdc": round(total, 4), "calls": len(_revenue_log),
             "by_endpoint": by_ep, "recent": _revenue_log[-10:]}
+
+
+# --- Auto-discovery endpoints ---
+
+@app.get("/.well-known/x402.json")
+async def x402_manifest():
+    """x402 service discovery — crawlers and AI agents find payable endpoints here."""
+    return {
+        "x402Version": 2,
+        "name": "SolSignal API",
+        "description": "Arena-calibrated trading signals from 646 AI agents tested against 20,000+ real Solana token snapshots.",
+        "homepage": "https://github.com/cryptomotifs/solsignal-api",
+        "network": SOLANA_NETWORK,
+        "asset": USDC_MINT,
+        "payTo": SOLANA_WALLET or "not_configured",
+        "facilitator": X402_FACILITATOR,
+        "endpoints": [
+            {
+                "path": "/signals/trending",
+                "method": "GET",
+                "description": "Top-performing agents and latest token snapshots",
+                "maxAmountRequired": str(PRICES["trending"]),
+                "currency": "USDC",
+                "priceUsd": "$0.01",
+            },
+            {
+                "path": "/signals/agent/{agent_name}",
+                "method": "GET",
+                "description": "Scores from a specific calibrated agent",
+                "maxAmountRequired": str(PRICES["agent"]),
+                "currency": "USDC",
+                "priceUsd": "$0.005",
+            },
+            {
+                "path": "/signals/analysis/{mint}",
+                "method": "GET",
+                "description": "Full multi-agent consensus analysis for a token",
+                "maxAmountRequired": str(PRICES["analysis"]),
+                "currency": "USDC",
+                "priceUsd": "$0.05",
+            },
+            {
+                "path": "/signals/bulk",
+                "method": "GET",
+                "description": "All scores from top 50 agents for recent tokens",
+                "maxAmountRequired": str(PRICES["bulk"]),
+                "currency": "USDC",
+                "priceUsd": "$0.10",
+            },
+        ],
+        "freeEndpoints": ["/", "/health", "/agents", "/docs"],
+        "token": {
+            "name": "Sol Signal AI",
+            "symbol": "SSAI",
+            "mint": "4KQnaEvCWp315CrVTvjUG7osfj2uAVCMpT5GhRQ7pump",
+        },
+    }
+
+
+@app.get("/.well-known/ai-plugin.json")
+async def ai_plugin():
+    """OpenAI-compatible plugin manifest — used by AI agent frameworks for discovery."""
+    return {
+        "schema_version": "v1",
+        "name_for_human": "SolSignal",
+        "name_for_model": "solsignal",
+        "description_for_human": "Arena-calibrated Solana trading signals from 646 AI agents.",
+        "description_for_model": (
+            "Provides Solana token trading signals from 646 AI agents, each tested against "
+            "20,000+ real market snapshots. Returns agent precision scores, tier1 picks, "
+            "multi-agent consensus analysis, and token price/volume/liquidity data. "
+            "Accepts x402 USDC payments on Solana or API key authentication."
+        ),
+        "auth": {"type": "none"},
+        "api": {
+            "type": "openapi",
+            "url": "https://solsignal-api.onrender.com/openapi.json",
+        },
+        "logo_url": "https://solsignal-api.onrender.com/logo.png",
+        "contact_email": "s_amr@users.noreply.github.com",
+        "legal_info_url": "https://github.com/cryptomotifs/solsignal-api",
+    }
+
+
+@app.get("/.well-known/agent.json")
+async def agent_manifest():
+    """Solana Agent Protocol discovery — for agent-to-agent communication."""
+    return {
+        "name": "SolSignal",
+        "description": "646 AI agents providing arena-calibrated Solana trading signals",
+        "url": "https://solsignal-api.onrender.com",
+        "documentationUrl": "https://solsignal-api.onrender.com/docs",
+        "capabilities": ["trading-signals", "token-analysis", "agent-scores"],
+        "payment": {
+            "protocol": "x402",
+            "network": "solana",
+            "asset": "USDC",
+            "facilitator": X402_FACILITATOR,
+        },
+        "version": "1.0.0",
+    }
