@@ -103,10 +103,10 @@ async def lifespan(app: FastAPI):
 
 async def _outcome_backfill_loop():
     """Run outcome backfill every 30 minutes."""
-    from tracker import backfill_outcomes
     while True:
         try:
             await asyncio.sleep(1800)  # 30 min
+            from tracker import backfill_outcomes
             await backfill_outcomes()
         except asyncio.CancelledError:
             break
