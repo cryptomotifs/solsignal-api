@@ -205,13 +205,23 @@ def compute_verdict(
     score = 100  # Start at 100, deduct for each issue
 
     # --- Honeypot (Jupiter simulation) ---
+    # Cross-reference with DexScreener: if token has high liquidity + age,
+    # a failed Jupiter quote is likely API issues, not a real honeypot.
+    is_established = (
+        dex.get("liquidity_usd", 0) > 50_000 and dex.get("age_hours", 0) > 24
+    )
+
     if jup_sim:
         sell_failed = jup_sim.get("sell_failed", False)
         sell_tax = jup_sim.get("sell_tax_pct", 0)
         if sell_failed:
-            checks["honeypot"] = {"pass": False, "detail": "sell quote failed"}
-            risk_flags.append("HONEYPOT_SUSPECTED")
-            score -= 40
+            if is_established:
+                # Established token — Jupiter fail is likely API issue, not honeypot
+                checks["honeypot"] = {"pass": True, "detail": "sell quote failed but token is established (neutral)"}
+            else:
+                checks["honeypot"] = {"pass": False, "detail": "sell quote failed"}
+                risk_flags.append("HONEYPOT_SUSPECTED")
+                score -= 40
         elif sell_tax > 10:
             checks["honeypot"] = {"pass": False, "detail": f"high sell tax ({sell_tax}%)"}
             risk_flags.append("HIGH_SELL_TAX")
