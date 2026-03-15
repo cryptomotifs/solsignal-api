@@ -233,9 +233,10 @@ async def root():
         "endpoints": {
             "/health": "Free - System status",
             "/agents": "Free - All agents with precision stats",
+            "/signals/live/{mint}": "$0.05 - REAL-TIME scoring of ANY Solana token",
             "/signals/trending": "$0.01 - Top tier1 picks from best agents",
             "/signals/agent/{name}": "$0.005 - Specific agent's scores",
-            "/signals/analysis/{mint}": "$0.05 - Full multi-agent token consensus",
+            "/signals/analysis/{mint}": "$0.05 - Full multi-agent token consensus (historical)",
             "/signals/bulk": "$0.10 - All scores for all recent tokens",
         },
         "auth": ["x402 (USDC on Solana)", "API key (X-API-Key header)"],
@@ -374,6 +375,66 @@ async def bulk(request: Request):
     }
 
 
+@app.get("/signals/live/{mint}")
+async def live_score(request: Request, mint: str, top_n: int = 20):
+    """Score ANY Solana token in real-time against all 646 calibrated agents."""
+    block = await _gate(request, f"/signals/live/{mint}", "analysis")
+    if block:
+        return block
+
+    from scoring import fetch_token_data, compute_derived_metrics, score_with_agents, compute_consensus
+
+    # Fetch live data from DexScreener
+    token_data = await fetch_token_data(mint)
+    if not token_data:
+        return {"error": f"Token {mint} not found on DexScreener (Solana pairs only)"}
+
+    # Compute derived metrics
+    derived = compute_derived_metrics(token_data)
+
+    # Score through all agents
+    configs = _load_boost_configs()
+    results = score_with_agents(derived, configs)
+
+    # Consensus
+    consensus = compute_consensus(results)
+
+    # Top agents that like this token
+    top_bullish = [r for r in results if r["tier"] == "tier1"][:top_n]
+    # Top agents that dislike it
+    top_bearish = results[-top_n:]
+
+    # Risk flags
+    risk_flags = []
+    if derived.get("rug_risk", 0) > 0.7:
+        risk_flags.append("HIGH_RUG_RISK")
+    if derived.get("liquidity_depth", 1) < 0.1:
+        risk_flags.append("LOW_LIQUIDITY")
+    if derived.get("age_safety", 1) < 0.1:
+        risk_flags.append("VERY_NEW_TOKEN")
+    if derived.get("concentration_risk", 0) > 0.8:
+        risk_flags.append("LOW_TRANSACTION_COUNT")
+    if derived.get("volatility_risk", 0) > 0.7:
+        risk_flags.append("HIGH_VOLATILITY")
+
+    return {
+        "mint": mint,
+        "symbol": token_data.get("symbol", "???"),
+        "price_usd": token_data.get("price_usd"),
+        "market_cap": token_data.get("market_cap"),
+        "liquidity_usd": token_data.get("liquidity_usd"),
+        "volume_24h": token_data.get("volume_24h"),
+        "price_change_1h": token_data.get("price_change_1h"),
+        "price_change_24h": token_data.get("price_change_24h"),
+        "consensus": consensus,
+        "top_bullish_agents": top_bullish,
+        "top_bearish_agents": top_bearish,
+        "risk_flags": risk_flags,
+        "metrics_computed": len(derived),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/revenue")
 async def revenue():
     total = sum(r["amount_usdc"] for r in _revenue_log)
@@ -399,6 +460,14 @@ async def x402_manifest():
         "payTo": SOLANA_WALLET or "not_configured",
         "facilitator": X402_FACILITATOR,
         "endpoints": [
+            {
+                "path": "/signals/live/{mint}",
+                "method": "GET",
+                "description": "Real-time scoring of ANY Solana token through 646 calibrated agents",
+                "maxAmountRequired": str(PRICES["analysis"]),
+                "currency": "USDC",
+                "priceUsd": "$0.05",
+            },
             {
                 "path": "/signals/trending",
                 "method": "GET",
