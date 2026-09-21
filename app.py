@@ -292,15 +292,6 @@ def _deduct_credit(key: str):
             pass
 
 
-def _log_revenue(endpoint: str, amount: float, method: str):
-    _revenue_log.append({
-        "endpoint": endpoint,
-        "amount_usdc": amount,
-        "method": method,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    })
-
-
 # --- x402 v2 + settlement-backed revenue ---
 
 def _init_payments_db() -> None:
