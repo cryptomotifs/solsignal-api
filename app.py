@@ -46,7 +46,7 @@ RESULTS_DB = os.path.join(DATA_DIR, "arena_results.db")
 BOOST_CONFIGS = os.path.join(DATA_DIR, "agent_boost_configs.json")
 API_KEYS_FILE = os.path.join(DATA_DIR, "api_keys.json")
 
-SOLANA_WALLET = os.environ.get("SIGNAL_WALLET", "").strip()
+SOLANA_WALLET = os.environ.get("SIGNAL_WALLET", "HDJ88KsVwUGxGZmEdKtgMxHvssZR4gfFp1v1izCPK5x9").strip()
 # Production x402 v2 facilitator. Override deliberately via environment if needed.
 X402_FACILITATOR = os.environ.get(
     "X402_FACILITATOR", "https://x402.dexter.cash"
