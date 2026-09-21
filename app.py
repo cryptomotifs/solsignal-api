@@ -51,8 +51,10 @@ SOLANA_WALLET = os.environ.get("SIGNAL_WALLET", "HDJ88KsVwUGxGZmEdKtgMxHvssZR4gf
 X402_FACILITATOR = os.environ.get(
     "X402_FACILITATOR", "https://x402.dexter.cash"
 ).rstrip("/")
-PUBLIC_BASE_URL = os.environ.get(
-    "PUBLIC_BASE_URL", "https://solsignal-api.onrender.com"
+PUBLIC_BASE_URL = (
+    os.environ.get("PUBLIC_BASE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or "https://solsignal-api.onrender.com"
 ).rstrip("/")
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
