@@ -26,6 +26,18 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from x402.http import (
+    FacilitatorConfig,
+    HTTPFacilitatorClient,
+    decode_payment_signature_header,
+    encode_payment_required_header,
+    encode_payment_response_header,
+)
+from x402.mechanisms.svm.exact import ExactSvmServerScheme
+from x402.schemas import AssetAmount, ResourceConfig, ResourceInfo
+from x402.server import x402ResourceServer
 
 # --- Config ---
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -34,18 +46,37 @@ RESULTS_DB = os.path.join(DATA_DIR, "arena_results.db")
 BOOST_CONFIGS = os.path.join(DATA_DIR, "agent_boost_configs.json")
 API_KEYS_FILE = os.path.join(DATA_DIR, "api_keys.json")
 
-SOLANA_WALLET = os.environ.get("SIGNAL_WALLET", "")
-X402_FACILITATOR = os.environ.get("X402_FACILITATOR", "https://x402.org/facilitator")
+SOLANA_WALLET = os.environ.get("SIGNAL_WALLET", "").strip()
+# Production x402 v2 facilitator. Override deliberately via environment if needed.
+X402_FACILITATOR = os.environ.get(
+    "X402_FACILITATOR", "https://x402.dexter.cash"
+).rstrip("/")
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "https://solsignal-api.onrender.com"
+).rstrip("/")
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
 PRICES = {
-    "scan": 10000,           # $0.01
+    "scan": 10000,           # $0.01 USDC, 6 decimals
     "trending": 10000,       # $0.01
     "agent": 5000,           # $0.005
     "analysis": 50000,       # $0.05
     "bulk": 100000,          # $0.10
 }
+
+PAYMENTS_DB = os.path.join(DATA_DIR, "payments.db")
+
+_x402_facilitator_client = HTTPFacilitatorClient(
+    FacilitatorConfig(url=X402_FACILITATOR)
+)
+_x402_resource_server = x402ResourceServer(_x402_facilitator_client).register(
+    SOLANA_NETWORK,
+    ExactSvmServerScheme(),
+)
+_x402_requirements_cache: dict[str, Any] = {}
+_x402_ready = False
+_x402_init_error = ""
 
 # --- Free tier rate limiting ---
 # IP -> {date_str: count}
@@ -89,7 +120,25 @@ _background_tasks: set[asyncio.Task] = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle — starts background outcome backfiller."""
+    """Startup/shutdown lifecycle.
+
+    Initialize production x402 capabilities before accepting paid requests.
+    If the facilitator is temporarily unavailable, the API stays up but paid
+    requests fail closed rather than being counted as revenue.
+    """
+    global _x402_ready, _x402_init_error
+
+    if SOLANA_WALLET:
+        try:
+            await asyncio.to_thread(_x402_resource_server.initialize)
+            _x402_ready = True
+            _x402_init_error = ""
+        except Exception as exc:
+            _x402_ready = False
+            _x402_init_error = str(exc)
+
+    _init_payments_db()
+
     task = asyncio.create_task(_outcome_backfill_loop())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -99,6 +148,7 @@ async def lifespan(app: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
+    await _x402_facilitator_client.aclose()
 
 
 async def _outcome_backfill_loop():
@@ -137,11 +187,58 @@ app.add_middleware(
     expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE"],
 )
 
+@app.middleware("http")
+async def settle_verified_x402(request: Request, call_next):
+    """Settle verified payments only after successful endpoint execution.
+
+    A verify result is never counted as revenue. Revenue is written only after
+    the facilitator returns success with an on-chain transaction signature.
+    """
+    response = await call_next(request)
+    payload = getattr(request.state, "x402_payment_payload", None)
+    requirements = getattr(request.state, "x402_payment_requirements", None)
+
+    if payload is None or requirements is None:
+        return response
+    if not 200 <= response.status_code < 300:
+        return response
+
+    try:
+        settle_result = await _x402_resource_server.settle_payment(payload, requirements)
+    except Exception:
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Payment settlement failed; no revenue was recorded"},
+        )
+
+    if not settle_result.success or not settle_result.transaction:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "Payment settlement was not confirmed",
+                "reason": settle_result.error_reason,
+            },
+        )
+
+    amount_atomic = int(
+        getattr(settle_result, "amount", None)
+        or getattr(request.state, "x402_amount_atomic", 0)
+    )
+    _record_settlement(
+        transaction=settle_result.transaction,
+        endpoint=getattr(request.state, "x402_endpoint", request.url.path),
+        amount_atomic=amount_atomic,
+        payer=settle_result.payer,
+        network=settle_result.network,
+    )
+    response.headers["PAYMENT-RESPONSE"] = encode_payment_response_header(settle_result)
+    return response
+
+
 # --- Caches ---
 _boost_cache: dict | None = None
 _boost_cache_ts: float = 0
 _api_keys: dict = {}
-_revenue_log: list[dict] = []
 
 
 def _load_boost_configs() -> dict:
@@ -204,108 +301,229 @@ def _log_revenue(endpoint: str, amount: float, method: str):
     })
 
 
-# --- x402 ---
+# --- x402 v2 + settlement-backed revenue ---
 
-def _build_402(resource: str, price_key: str) -> Response:
-    amount = PRICES.get(price_key, 10000)
-    if not SOLANA_WALLET:
-        return Response(
-            status_code=402,
-            content=json.dumps({
-                "error": "Payment required",
-                "message": "Use X-API-Key header or configure x402 wallet",
-                "pricing": {k: f"${v / 1_000_000:.4f}" for k, v in PRICES.items()},
-            }),
-            media_type="application/json",
+def _init_payments_db() -> None:
+    """Create the settlement ledger used by the public revenue endpoint."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(PAYMENTS_DB)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settlements (
+                transaction TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                amount_atomic INTEGER NOT NULL,
+                amount_usdc REAL NOT NULL,
+                payer TEXT,
+                network TEXT NOT NULL,
+                facilitator TEXT NOT NULL,
+                settled_at TEXT NOT NULL
+            )
+            """
         )
-    payload = {
-        "x402Version": 2,
-        "accepts": [{
-            "scheme": "exact",
-            "network": SOLANA_NETWORK,
-            "maxAmountRequired": str(amount),
-            "resource": resource,
-            "description": f"SolSignal: {price_key}",
-            "payTo": SOLANA_WALLET,
-            "asset": USDC_MINT,
-            "maxTimeoutSeconds": 60,
-        }],
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _record_settlement(
+    *,
+    transaction: str,
+    endpoint: str,
+    amount_atomic: int,
+    payer: str | None,
+    network: str,
+) -> None:
+    """Persist a confirmed on-chain settlement exactly once."""
+    if not transaction:
+        raise ValueError("A confirmed settlement must include a transaction signature")
+    _init_payments_db()
+    conn = sqlite3.connect(PAYMENTS_DB)
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO settlements
+            (transaction, endpoint, amount_atomic, amount_usdc, payer, network, facilitator, settled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transaction,
+                endpoint,
+                int(amount_atomic),
+                int(amount_atomic) / 1_000_000,
+                payer,
+                network,
+                X402_FACILITATOR,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _payment_stats() -> dict[str, Any]:
+    """Return revenue derived only from confirmed settlement receipts."""
+    _init_payments_db()
+    conn = sqlite3.connect(PAYMENTS_DB)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_atomic), 0) AS total FROM settlements"
+        ).fetchone()
+        recent = [
+            dict(r)
+            for r in conn.execute(
+                """
+                SELECT transaction, endpoint, amount_usdc, payer, network, facilitator, settled_at
+                FROM settlements
+                ORDER BY settled_at DESC
+                LIMIT 20
+                """
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    total_atomic = int(row["total"]) if row else 0
+    count = int(row["cnt"]) if row else 0
+    return {
+        "total_usdc": round(total_atomic / 1_000_000, 6),
+        "settlements": count,
+        "recent": recent,
     }
-    encoded = base64.b64encode(json.dumps(payload).encode()).decode()
-    return Response(
+
+
+def _get_x402_requirements(price_key: str):
+    """Build facilitator-enriched SVM payment requirements for one price."""
+    if not SOLANA_WALLET:
+        raise RuntimeError("SIGNAL_WALLET is not configured")
+    if not _x402_ready:
+        raise RuntimeError("x402 facilitator is not ready")
+
+    cached = _x402_requirements_cache.get(price_key)
+    if cached is not None:
+        return cached
+
+    amount = PRICES.get(price_key, 10000)
+    config = ResourceConfig(
+        scheme="exact",
+        price=AssetAmount(amount=str(amount), asset=USDC_MINT),
+        network=SOLANA_NETWORK,
+        pay_to=SOLANA_WALLET,
+        max_timeout_seconds=60,
+    )
+    built = _x402_resource_server.build_payment_requirements(config)
+    if not built:
+        raise RuntimeError("Unable to build x402 payment requirements")
+
+    _x402_requirements_cache[price_key] = built[0]
+    return built[0]
+
+
+async def _build_402(resource: str, price_key: str) -> Response:
+    """Return a canonical x402 v2 PaymentRequired response."""
+    if not SOLANA_WALLET:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Payment service is not configured"},
+        )
+    if not _x402_ready:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Payment service is temporarily unavailable"},
+        )
+
+    requirements = _get_x402_requirements(price_key)
+    payment_required = await _x402_resource_server.create_payment_required_response(
+        [requirements],
+        resource=ResourceInfo(
+            url=f"{PUBLIC_BASE_URL}{resource}",
+            description=f"SolSignal paid API: {price_key}",
+            mime_type="application/json",
+            service_name="SolSignal",
+            tags=["solana", "token-safety", "crypto"],
+        ),
+        error="Payment required",
+    )
+    payload = payment_required.model_dump(by_alias=True, exclude_none=True)
+    return JSONResponse(
         status_code=402,
-        content=json.dumps(payload),
-        media_type="application/json",
-        headers={"PAYMENT-REQUIRED": encoded},
+        content=payload,
+        headers={"PAYMENT-REQUIRED": encode_payment_required_header(payment_required)},
     )
 
 
-async def _verify_x402(payment_header: str, resource: str, price_key: str) -> bool:
-    if not SOLANA_WALLET:
+async def _authorize_x402(
+    request: Request,
+    payment_header: str,
+    resource: str,
+    price_key: str,
+) -> bool:
+    """Verify an x402 v2 payment authorization without counting it as revenue."""
+    if not SOLANA_WALLET or not _x402_ready:
         return False
-    amount = PRICES.get(price_key, 10000)
-    req_data = {
-        "scheme": "exact",
-        "network": SOLANA_NETWORK,
-        "maxAmountRequired": str(amount),
-        "resource": resource,
-        "payTo": SOLANA_WALLET,
-        "asset": USDC_MINT,
-        "maxTimeoutSeconds": 60,
-    }
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{X402_FACILITATOR}/verify",
-                json={"payload": payment_header, "paymentRequirements": req_data},
-            )
-            if resp.status_code == 200:
-                return resp.json().get("isValid", False)
+        payload = decode_payment_signature_header(payment_header)
+        if getattr(payload, "x402_version", None) != 2:
+            return False
+
+        requirements = _get_x402_requirements(price_key)
+        matched = _x402_resource_server.find_matching_requirements([requirements], payload)
+        if matched is None:
+            return False
+
+        verify_result = await _x402_resource_server.verify_payment(payload, matched)
+        if not verify_result.is_valid:
+            return False
+
+        # Settlement happens only after the endpoint returns a successful response.
+        request.state.x402_payment_payload = payload
+        request.state.x402_payment_requirements = matched
+        request.state.x402_endpoint = resource
+        request.state.x402_amount_atomic = int(matched.amount)
+        return True
     except Exception:
-        pass
-    return False
+        return False
 
 
 async def _gate(request: Request, resource: str, price_key: str) -> Response | None:
-    """Returns None if authorized, or a 402 Response."""
+    """Authorize an API key or a verified x402 payment."""
     api_key = request.headers.get("x-api-key")
     if _check_api_key(api_key):
         _deduct_credit(api_key)
-        _log_revenue(resource, PRICES.get(price_key, 10000) / 1_000_000, "api_key")
         return None
 
-    payment = request.headers.get("payment-signature") or request.headers.get("x-payment")
-    if payment:
-        if await _verify_x402(payment, resource, price_key):
-            _log_revenue(resource, PRICES.get(price_key, 10000) / 1_000_000, "x402")
-            return None
+    payment = request.headers.get("payment-signature")
+    if payment and await _authorize_x402(request, payment, resource, price_key):
+        return None
 
-    return _build_402(resource, price_key)
+    return await _build_402(resource, price_key)
 
 
-async def _gate_or_free(request: Request, resource: str, price_key: str, free_endpoint: str) -> Response | None:
-    """Like _gate, but allows free tier by IP first."""
-    # Check API key / x402 first
+async def _gate_or_free(
+    request: Request,
+    resource: str,
+    price_key: str,
+    free_endpoint: str,
+) -> Response | None:
+    """Allow API key/x402 payment, otherwise consume the free IP quota."""
     api_key = request.headers.get("x-api-key")
     if _check_api_key(api_key):
         _deduct_credit(api_key)
-        _log_revenue(resource, PRICES.get(price_key, 10000) / 1_000_000, "api_key")
         return None
 
-    payment = request.headers.get("payment-signature") or request.headers.get("x-payment")
-    if payment:
-        if await _verify_x402(payment, resource, price_key):
-            _log_revenue(resource, PRICES.get(price_key, 10000) / 1_000_000, "x402")
-            return None
+    payment = request.headers.get("payment-signature")
+    if payment and await _authorize_x402(request, payment, resource, price_key):
+        return None
 
-    # Free tier check by IP
     ip = request.client.host if request.client else "unknown"
     if _check_free_tier(ip, free_endpoint):
         _record_free_usage(ip, free_endpoint)
         return None
 
-    return _build_402(resource, price_key)
+    return await _build_402(resource, price_key)
 
 
 # --- Data queries ---
@@ -355,7 +573,7 @@ async def root():
             "x402": "$0.01/scan (USDC on Solana)",
         },
         "auth": ["Free tier (IP)", "API key (X-API-Key header)", "x402 (USDC on Solana)"],
-        "x402_enabled": bool(SOLANA_WALLET),
+        "x402_enabled": bool(SOLANA_WALLET and _x402_ready),
         "sources": ["DexScreener", "RugCheck", "GoPlus", "Jupiter Simulation"],
         "agents": len(configs),
         "token": {
@@ -464,8 +682,13 @@ async def health():
         },
         "agents": len(configs),
         "snapshots": snap_count,
-        "x402": bool(SOLANA_WALLET),
-        "revenue_calls": len(_revenue_log),
+        "x402": {
+            "configured": bool(SOLANA_WALLET),
+            "ready": bool(_x402_ready),
+            "facilitator": X402_FACILITATOR,
+            "network": SOLANA_NETWORK,
+        },
+        "revenue_settlements": _payment_stats()["settlements"],
     }
 
 
@@ -483,12 +706,22 @@ async def list_agents():
 
 @app.get("/revenue")
 async def revenue():
-    total = sum(r["amount_usdc"] for r in _revenue_log)
-    by_ep = {}
-    for r in _revenue_log:
-        by_ep[r["endpoint"]] = by_ep.get(r["endpoint"], 0) + r["amount_usdc"]
-    return {"total_usdc": round(total, 4), "calls": len(_revenue_log),
-            "by_endpoint": by_ep, "recent": _revenue_log[-10:]}
+    """Public settlement-backed revenue record.
+
+    Only confirmed x402 on-chain settlements count as revenue. API-key usage is
+    reported separately because consuming credits does not prove a new payment.
+    """
+    stats = _payment_stats()
+    keys = _load_api_keys()
+    api_key_calls = sum(int(v.get("total_calls", 0)) for v in keys.values())
+    return {
+        **stats,
+        "currency": "USDC",
+        "recipient": SOLANA_WALLET or None,
+        "facilitator": X402_FACILITATOR,
+        "api_key_calls": api_key_calls,
+        "verification_rule": "x402 settlement success + non-empty on-chain transaction",
+    }
 
 
 # =========================================================================
@@ -679,7 +912,7 @@ async def x402_manifest():
                 "path": "/scan/{mint}",
                 "method": "GET",
                 "description": "Token safety scan — 4 sources, 1 verdict (10 free/day)",
-                "maxAmountRequired": str(PRICES["scan"]),
+                "amount": str(PRICES["scan"]),
                 "currency": "USDC",
                 "priceUsd": "$0.01",
             },
@@ -687,7 +920,7 @@ async def x402_manifest():
                 "path": "/trending",
                 "method": "GET",
                 "description": "Safety-screened trending Solana tokens (3 free/day)",
-                "maxAmountRequired": str(PRICES["trending"]),
+                "amount": str(PRICES["trending"]),
                 "currency": "USDC",
                 "priceUsd": "$0.01",
             },
@@ -695,7 +928,7 @@ async def x402_manifest():
                 "path": "/signals/live/{mint}",
                 "method": "GET",
                 "description": "Experimental: Real-time 646-agent scoring",
-                "maxAmountRequired": str(PRICES["analysis"]),
+                "amount": str(PRICES["analysis"]),
                 "currency": "USDC",
                 "priceUsd": "$0.05",
             },
@@ -703,7 +936,7 @@ async def x402_manifest():
                 "path": "/signals/trending",
                 "method": "GET",
                 "description": "Legacy: Top-performing agents and latest snapshots",
-                "maxAmountRequired": str(PRICES["trending"]),
+                "amount": str(PRICES["trending"]),
                 "currency": "USDC",
                 "priceUsd": "$0.01",
             },
@@ -711,7 +944,7 @@ async def x402_manifest():
                 "path": "/signals/agent/{agent_name}",
                 "method": "GET",
                 "description": "Legacy: Scores from a specific calibrated agent",
-                "maxAmountRequired": str(PRICES["agent"]),
+                "amount": str(PRICES["agent"]),
                 "currency": "USDC",
                 "priceUsd": "$0.005",
             },
@@ -719,7 +952,7 @@ async def x402_manifest():
                 "path": "/signals/analysis/{mint}",
                 "method": "GET",
                 "description": "Legacy: Full multi-agent consensus analysis",
-                "maxAmountRequired": str(PRICES["analysis"]),
+                "amount": str(PRICES["analysis"]),
                 "currency": "USDC",
                 "priceUsd": "$0.05",
             },
@@ -727,7 +960,7 @@ async def x402_manifest():
                 "path": "/signals/bulk",
                 "method": "GET",
                 "description": "Legacy: All scores from top 50 agents for recent tokens",
-                "maxAmountRequired": str(PRICES["bulk"]),
+                "amount": str(PRICES["bulk"]),
                 "currency": "USDC",
                 "priceUsd": "$0.10",
             },
