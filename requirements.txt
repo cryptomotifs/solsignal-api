@@ -2,3 +2,5 @@ fastapi>=0.115.0
 uvicorn>=0.27.0
 httpx>=0.28.1
 x402[svm]==2.23.0
+# x402 2.23.0 still imports solana.rpc.api.Client; solana-py 0.40 removed it.
+solana==0.39.0
