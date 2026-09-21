@@ -63,6 +63,11 @@ PRICES = {
     "agent": 5000,           # $0.005
     "analysis": 50000,       # $0.05
     "bulk": 100000,          # $0.10
+    "tool_json": 1000,        # $0.001
+    "tool_url": 3000,         # $0.003
+    "tool_defi": 3000,        # $0.003
+    "tool_pdf": 5000,         # $0.005
+    "tool_repo": 10000,       # $0.01
 }
 
 PAYMENTS_DB = os.path.join(DATA_DIR, "payments.db")
@@ -554,6 +559,14 @@ async def root():
             "/signals/agent/{name}": "$0.005 — Specific agent's scores",
             "/signals/analysis/{mint}": "$0.05 — Full multi-agent consensus (historical)",
             "/signals/bulk": "$0.10 — All scores for all recent tokens",
+            "## CIPHER Agent Tools": "---",
+            "/tools/catalog": "Free — machine-readable paid-tool catalog",
+            "/tools/defi/yields": "$0.003 — normalized/filterable DeFi yield data",
+            "/tools/defi/protocols": "$0.003 — normalized/filterable DeFi protocol data",
+            "/tools/repo/preflight": "$0.01 — GitHub integration preflight",
+            "/tools/url/read": "$0.003 — public page to agent-readable markdown",
+            "/tools/pdf/markdown": "$0.005 — PDF text layer to markdown",
+            "/tools/json/repair": "$0.001 — repair malformed LLM JSON",
             "## System": "---",
             "/health": "Free — System status",
             "/agents": "Free — All agents with precision stats",
@@ -563,7 +576,7 @@ async def root():
             "free": "10 scans/day + 3 trending/day (by IP)",
             "developer": "$9/month — 1000 scans/month",
             "pro": "$29/month — 5000 scans/month",
-            "x402": "$0.01/scan (USDC on Solana)",
+            "x402": "$0.001-$0.10 per call (USDC on Solana)",
         },
         "auth": ["Free tier (IP)", "API key (X-API-Key header)", "x402 (USDC on Solana)"],
         "x402_enabled": bool(SOLANA_WALLET and _x402_ready),
@@ -645,6 +658,217 @@ async def track_token(mint: str):
     """Scan history for a specific token — all past scans with outcomes."""
     from tracker import get_token_history
     return get_token_history(mint)
+
+
+
+# =========================================================================
+# CIPHER AGENT TOOLS — low-cost machine-to-machine utilities
+# =========================================================================
+
+@app.get("/tools/catalog")
+async def tools_catalog():
+    """Free machine-readable catalog of CIPHER agent utilities."""
+    return {
+        "name": "CIPHER Agent Tools",
+        "payment": "x402 v2 / USDC on Solana",
+        "recipient": SOLANA_WALLET or None,
+        "tools": [
+            {
+                "path": "/tools/defi/yields",
+                "method": "GET",
+                "price_usdc": 0.003,
+                "use_case": "Filter current DeFi yield pools by chain, token, TVL, APY, or stablecoin flag.",
+                "upstream": "DefiLlama public API",
+            },
+            {
+                "path": "/tools/defi/protocols",
+                "method": "GET",
+                "price_usdc": 0.003,
+                "use_case": "Rank/filter DeFi protocols by chain, category, and TVL.",
+                "upstream": "DefiLlama public API",
+            },
+            {
+                "path": "/tools/repo/preflight",
+                "method": "GET",
+                "price_usdc": 0.01,
+                "use_case": "Preflight a public GitHub repo for maintenance, license, CI, security policy, and integration risk.",
+            },
+            {
+                "path": "/tools/url/read",
+                "method": "POST",
+                "price_usdc": 0.003,
+                "use_case": "Turn a public HTML/text URL into compact agent-readable markdown plus links.",
+            },
+            {
+                "path": "/tools/pdf/markdown",
+                "method": "POST",
+                "price_usdc": 0.005,
+                "use_case": "Extract the text layer of a public PDF into page-structured markdown.",
+            },
+            {
+                "path": "/tools/json/repair",
+                "method": "POST",
+                "price_usdc": 0.001,
+                "use_case": "Repair common malformed LLM JSON without another model call.",
+            },
+        ],
+    }
+
+
+def _paid_resource(request: Request) -> str:
+    """Bind the payment challenge to the requested route/query."""
+    if request.url.query:
+        return f"{request.url.path}?{request.url.query}"
+    return request.url.path
+
+
+@app.get("/tools/defi/yields")
+async def tool_defi_yields(
+    request: Request,
+    chain: str | None = None,
+    token: str | None = None,
+    min_tvl: float = 0,
+    min_apy: float = 0,
+    stablecoin_only: bool = False,
+    limit: int = 20,
+):
+    block = await _gate(request, _paid_resource(request), "tool_defi")
+    if block:
+        return block
+    try:
+        from agent_tools import ToolError, defi_yields
+        return await defi_yields(
+            chain=chain,
+            token=token,
+            min_tvl=max(min_tvl, 0),
+            min_apy=max(min_apy, 0),
+            stablecoin_only=stablecoin_only,
+            limit=limit,
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.get("/tools/defi/protocols")
+async def tool_defi_protocols(
+    request: Request,
+    chain: str | None = None,
+    category: str | None = None,
+    min_tvl: float = 0,
+    limit: int = 20,
+):
+    block = await _gate(request, _paid_resource(request), "tool_defi")
+    if block:
+        return block
+    try:
+        from agent_tools import ToolError, defi_protocols
+        return await defi_protocols(
+            chain=chain,
+            category=category,
+            min_tvl=max(min_tvl, 0),
+            limit=limit,
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.get("/tools/repo/preflight")
+async def tool_repo_preflight(request: Request, repo: str):
+    block = await _gate(request, _paid_resource(request), "tool_repo")
+    if block:
+        return block
+    try:
+        from agent_tools import ToolError, repo_preflight
+        return await repo_preflight(
+            repo,
+            github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/url/read")
+async def tool_url_read(request: Request, payload: dict[str, Any]):
+    block = await _gate(request, request.url.path, "tool_url")
+    if block:
+        return block
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "url is required"})
+    try:
+        from agent_tools import ToolError, read_url
+        return await read_url(url, max_chars=int(payload.get("max_chars") or 50000))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "max_chars must be an integer"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/pdf/markdown")
+async def tool_pdf_markdown(request: Request, payload: dict[str, Any]):
+    block = await _gate(request, request.url.path, "tool_pdf")
+    if block:
+        return block
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "url is required"})
+    try:
+        from agent_tools import ToolError, pdf_to_markdown
+        return await pdf_to_markdown(
+            url,
+            max_pages=int(payload.get("max_pages") or 20),
+            max_chars=int(payload.get("max_chars") or 80000),
+        )
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "max_pages and max_chars must be integers"},
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/json/repair")
+async def tool_json_repair(request: Request, payload: dict[str, Any]):
+    block = await _gate(request, request.url.path, "tool_json")
+    if block:
+        return block
+    raw = payload.get("text")
+    if not isinstance(raw, str) or not raw:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "text must be a non-empty string"},
+        )
+    try:
+        from agent_tools import ToolError, repair_json
+        return repair_json(raw)
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.get("/llms.txt")
+async def llms_txt():
+    content = """# CIPHER Agent Tools / SolSignal
+
+Machine-payable APIs for AI agents. Payment: x402 v2, USDC on Solana.
+
+Free discovery:
+- GET /tools/catalog
+- GET /docs
+- GET /.well-known/x402.json
+- GET /.well-known/agent.json
+- GET /revenue
+
+Paid tools:
+- GET /tools/defi/yields — $0.003
+- GET /tools/defi/protocols — $0.003
+- GET /tools/repo/preflight — $0.01
+- POST /tools/url/read — $0.003
+- POST /tools/pdf/markdown — $0.005
+- POST /tools/json/repair — $0.001
+- GET /scan/{mint} — Solana token safety
+"""
+    return Response(content=content, media_type="text/plain; charset=utf-8")
 
 
 # =========================================================================
@@ -957,8 +1181,56 @@ async def x402_manifest():
                 "currency": "USDC",
                 "priceUsd": "$0.10",
             },
+            {
+                "path": "/tools/defi/yields",
+                "method": "GET",
+                "description": "Filter normalized current DeFi yield pools",
+                "amount": str(PRICES["tool_defi"]),
+                "currency": "USDC",
+                "priceUsd": "$0.003",
+            },
+            {
+                "path": "/tools/defi/protocols",
+                "method": "GET",
+                "description": "Filter normalized DeFi protocol/TVL data",
+                "amount": str(PRICES["tool_defi"]),
+                "currency": "USDC",
+                "priceUsd": "$0.003",
+            },
+            {
+                "path": "/tools/repo/preflight",
+                "method": "GET",
+                "description": "GitHub repo maintenance/license/integration preflight",
+                "amount": str(PRICES["tool_repo"]),
+                "currency": "USDC",
+                "priceUsd": "$0.01",
+            },
+            {
+                "path": "/tools/url/read",
+                "method": "POST",
+                "description": "Public URL to compact agent-readable markdown",
+                "amount": str(PRICES["tool_url"]),
+                "currency": "USDC",
+                "priceUsd": "$0.003",
+            },
+            {
+                "path": "/tools/pdf/markdown",
+                "method": "POST",
+                "description": "Public PDF text-layer extraction to markdown",
+                "amount": str(PRICES["tool_pdf"]),
+                "currency": "USDC",
+                "priceUsd": "$0.005",
+            },
+            {
+                "path": "/tools/json/repair",
+                "method": "POST",
+                "description": "Repair common malformed LLM JSON",
+                "amount": str(PRICES["tool_json"]),
+                "currency": "USDC",
+                "priceUsd": "$0.001",
+            },
         ],
-        "freeEndpoints": ["/", "/health", "/agents", "/track/stats", "/track/{mint}", "/docs"],
+        "freeEndpoints": ["/", "/health", "/agents", "/track/stats", "/track/{mint}", "/tools/catalog", "/llms.txt", "/docs"],
         "token": {
             "name": "Sol Signal AI",
             "symbol": "SSAI",
@@ -1018,6 +1290,12 @@ async def agent_manifest():
             "trading-signals",
             "token-analysis",
             "agent-scores",
+            "defi-yield-data",
+            "defi-protocol-data",
+            "github-repo-preflight",
+            "url-to-markdown",
+            "pdf-to-markdown",
+            "json-repair",
         ],
         "payment": {
             "protocol": "x402",
