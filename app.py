@@ -47,6 +47,7 @@ BOOST_CONFIGS = os.path.join(DATA_DIR, "agent_boost_configs.json")
 API_KEYS_FILE = os.path.join(DATA_DIR, "api_keys.json")
 
 SOLANA_WALLET = os.environ.get("SIGNAL_WALLET", "").strip()
+EXPECTED_SIGNAL_WALLET = "HDJ88KsVwUGxGZmEdKtgMxHvssZR4gfFp1v1izCPK5x9"
 # Production x402 v2 facilitator. Override deliberately via environment if needed.
 X402_FACILITATOR = os.environ.get(
     "X402_FACILITATOR", "https://x402.dexter.cash"
@@ -128,7 +129,10 @@ async def lifespan(app: FastAPI):
     """
     global _x402_ready, _x402_init_error
 
-    if SOLANA_WALLET:
+    if SOLANA_WALLET and SOLANA_WALLET != EXPECTED_SIGNAL_WALLET:
+        _x402_ready = False
+        _x402_init_error = "SIGNAL_WALLET does not match the approved payment recipient"
+    elif SOLANA_WALLET:
         try:
             await asyncio.to_thread(_x402_resource_server.initialize)
             _x402_ready = True
@@ -678,6 +682,8 @@ async def health():
         "x402": {
             "configured": bool(SOLANA_WALLET),
             "ready": bool(_x402_ready),
+            "recipient_matches_expected": SOLANA_WALLET == EXPECTED_SIGNAL_WALLET,
+            "expected_recipient": EXPECTED_SIGNAL_WALLET,
             "facilitator": X402_FACILITATOR,
             "network": SOLANA_NETWORK,
         },
