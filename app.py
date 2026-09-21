@@ -562,6 +562,7 @@ async def root():
             "/signals/bulk": "$0.10 — All scores for all recent tokens",
             "## CIPHER Agent Tools": "---",
             "/tools/catalog": "Free — machine-readable paid-tool catalog",
+            "/skill.md": "Free — agent-facing capability/payment contract",
             "/tools/defi/yields": "$0.003 — normalized/filterable DeFi yield data",
             "/tools/defi/protocols": "$0.003 — normalized/filterable DeFi protocol data",
             "/tools/repo/preflight": "$0.01 — GitHub integration preflight",
@@ -865,6 +866,73 @@ async def tool_json_repair(request: Request):
         return repair_json(raw)
     except ToolError as exc:
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.get("/skill.md")
+async def skill_md():
+    """Agent-facing contract for CIPHER Agent Tools."""
+    body = f"""---
+name: CIPHER Agent Tools
+description: Low-cost machine-payable utilities for AI agents: DeFi data, GitHub repo preflight, URL/PDF extraction, JSON repair, and Solana token safety.
+base_url: {PUBLIC_BASE_URL}
+payment: x402 v2
+network: {SOLANA_NETWORK}
+asset: USDC
+pay_to: {SOLANA_WALLET}
+---
+
+# CIPHER Agent Tools
+
+Use these endpoints when your agent needs normalized data or deterministic utility work without spending model tokens.
+
+## Discovery
+
+- `GET /tools/catalog` — free machine-readable catalog.
+- `GET /openapi.json` — free OpenAPI schema.
+- `GET /.well-known/x402` — free x402 compatibility manifest.
+- `GET /.well-known/x402.json` — detailed x402 manifest.
+- `GET /revenue` — settlement-backed public revenue counter.
+
+## Paid tools
+
+| Tool | Method | Price | Use when |
+|---|---|---:|---|
+| `/tools/defi/yields` | GET | $0.003 | Filter current DeFi yield pools by chain, token, TVL, APY, or stablecoin flag. |
+| `/tools/defi/protocols` | GET | $0.003 | Rank/filter protocols by chain, category, and TVL. |
+| `/tools/repo/preflight` | GET | $0.01 | Check a public GitHub repo's maintenance, license, CI, security policy, and integration-risk signals. |
+| `/tools/url/read` | POST | $0.003 | Convert a public HTML/text URL into compact agent-readable Markdown. |
+| `/tools/pdf/markdown` | POST | $0.005 | Extract a public PDF text layer into page-structured Markdown. |
+| `/tools/json/repair` | POST | $0.001 | Repair common malformed LLM JSON without another model call. |
+| `/scan/{{mint}}` | GET | $0.01 after free quota | Screen a Solana token across multiple safety sources. |
+
+## Payment flow
+
+1. Call the endpoint normally.
+2. If payment is required, the service returns HTTP 402 with a `PAYMENT-REQUIRED` header.
+3. Sign/pay the advertised x402 v2 USDC requirement on Solana.
+4. Retry with `PAYMENT-SIGNATURE`.
+5. On success, the response includes `PAYMENT-RESPONSE` with settlement details.
+
+Revenue is recorded only after a successful settlement with an on-chain transaction signature.
+
+## Spend guidance
+
+- Prefer DeFi data endpoints over model-generated market summaries when raw normalized data is enough.
+- Use JSON repair before retrying an LLM call.
+- Use repo preflight before importing an unfamiliar public dependency.
+- Use URL/PDF extraction for public resources only.
+- DeFi APY data is observational, not a recommendation or guarantee.
+
+## Examples
+
+`GET {PUBLIC_BASE_URL}/tools/defi/yields?chain=Solana&min_tvl=1000000&limit=10`
+
+`GET {PUBLIC_BASE_URL}/tools/repo/preflight?repo=openai/openai-agents-python`
+
+`POST {PUBLIC_BASE_URL}/tools/json/repair`
+body: `{{"text":"{{'ok': true,}}"}}`
+"""
+    return Response(content=body, media_type="text/markdown; charset=utf-8")
 
 
 @app.get("/llms.txt")
@@ -1268,7 +1336,7 @@ async def x402_manifest():
                 "priceUsd": "$0.001",
             },
         ],
-        "freeEndpoints": ["/", "/health", "/agents", "/track/stats", "/track/{mint}", "/tools/catalog", "/llms.txt", "/docs"],
+        "freeEndpoints": ["/", "/health", "/agents", "/track/stats", "/track/{mint}", "/tools/catalog", "/skill.md", "/llms.txt", "/docs"],
         "token": {
             "name": "Sol Signal AI",
             "symbol": "SSAI",
