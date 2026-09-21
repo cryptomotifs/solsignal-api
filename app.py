@@ -67,6 +67,7 @@ PRICES = {
     "bulk": 100000,          # $0.10
     "tool_ping": 1000,        # $0.001
     "tool_json": 1000,        # $0.001
+    "tool_transform": 1000,   # $0.001
     "tool_url": 3000,         # $0.003
     "tool_defi": 3000,        # $0.003
     "tool_pdf": 5000,         # $0.005
@@ -579,6 +580,7 @@ async def root():
             "/tools/url/read": "$0.003 — public page to agent-readable markdown",
             "/tools/pdf/markdown": "$0.005 — PDF text layer to markdown",
             "/tools/json/repair": "$0.001 — repair malformed LLM JSON",
+            "/tools/transform": "$0.001 — hash/encode/decode/JWT plumbing",
             "## System": "---",
             "/health": "Free — System status",
             "/agents": "Free — All agents with precision stats",
@@ -872,6 +874,31 @@ async def tool_pdf_markdown(request: Request):
             status_code=400,
             content={"error": "max_pages and max_chars must be integers"},
         )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/transform")
+async def tool_transform(request: Request):
+    block = await _gate(request, request.url.path, "tool_transform")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
+    operation = str(payload.get("operation") or "").strip()
+    value = payload.get("value")
+    if not operation or not isinstance(value, str):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "operation and string value are required"},
+        )
+    try:
+        from agent_tools import ToolError, transform_value
+        return transform_value(operation, value)
     except ToolError as exc:
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
@@ -1245,6 +1272,7 @@ async def x402_compat_manifest():
             f"{base}/tools/url/read",
             f"{base}/tools/pdf/markdown",
             f"{base}/tools/json/repair",
+            f"{base}/tools/transform",
             f"{base}/scan/{{mint}}",
         ],
     }
@@ -1378,6 +1406,14 @@ async def x402_manifest():
                 "currency": "USDC",
                 "priceUsd": "$0.001",
             },
+            {
+                "path": "/tools/transform",
+                "method": "POST",
+                "description": "Hash, Base64/hex/URL encode-decode, and decode JWT payloads",
+                "amount": str(PRICES["tool_transform"]),
+                "currency": "USDC",
+                "priceUsd": "$0.001",
+            },
         ],
         "freeEndpoints": ["/", "/health", "/agents", "/track/stats", "/track/{mint}", "/tools/catalog", "/skill.md", "/llms.txt", "/docs"],
         "token": {
@@ -1444,6 +1480,8 @@ async def agent_manifest():
             "url-to-markdown",
             "pdf-to-markdown",
             "json-repair",
+            "hashing-and-encoding",
+            "jwt-decode",
         ],
         "payment": {
             "protocol": "x402",

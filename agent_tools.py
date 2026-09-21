@@ -722,3 +722,105 @@ async def defi_protocols(
         "count": min(len(rows), limit),
         "results": rows[:limit],
     }
+
+
+def transform_value(operation: str, value: str) -> dict[str, Any]:
+    """Deterministic zero-model transforms for common agent plumbing."""
+    import base64 as _base64
+    import hashlib
+    from urllib.parse import quote, unquote
+
+    if not isinstance(value, str):
+        raise ToolError(400, "value must be a string")
+    if len(value) > 500_000:
+        raise ToolError(413, "Input is too large")
+
+    op = operation.strip().lower().replace("-", "_")
+    raw = value.encode("utf-8")
+
+    if op in {"sha256", "sha512", "sha1", "md5", "blake2b"}:
+        if op == "sha256":
+            result = hashlib.sha256(raw).hexdigest()
+        elif op == "sha512":
+            result = hashlib.sha512(raw).hexdigest()
+        elif op == "sha1":
+            result = hashlib.sha1(raw).hexdigest()
+        elif op == "md5":
+            result = hashlib.md5(raw).hexdigest()
+        else:
+            result = hashlib.blake2b(raw).hexdigest()
+        return {
+            "operation": op,
+            "result": result,
+            "encoding": "hex",
+            "note": "MD5 and SHA-1 are legacy hashes and should not be used for security-sensitive signatures." if op in {"md5", "sha1"} else None,
+        }
+
+    if op == "base64_encode":
+        return {
+            "operation": op,
+            "result": _base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+        }
+
+    if op == "base64_decode":
+        try:
+            padded = value.strip() + "=" * (-len(value.strip()) % 4)
+            decoded = _base64.b64decode(padded, validate=True)
+            result = decoded.decode("utf-8")
+        except Exception as exc:
+            raise ToolError(422, "Input is not valid UTF-8 Base64") from exc
+        return {"operation": op, "result": result, "encoding": "utf-8"}
+
+    if op == "base64url_decode":
+        try:
+            padded = value.strip() + "=" * (-len(value.strip()) % 4)
+            decoded = _base64.urlsafe_b64decode(padded)
+            result = decoded.decode("utf-8")
+        except Exception as exc:
+            raise ToolError(422, "Input is not valid UTF-8 Base64URL") from exc
+        return {"operation": op, "result": result, "encoding": "utf-8"}
+
+    if op == "hex_encode":
+        return {"operation": op, "result": raw.hex(), "encoding": "hex"}
+
+    if op == "hex_decode":
+        try:
+            result = bytes.fromhex(value.strip()).decode("utf-8")
+        except Exception as exc:
+            raise ToolError(422, "Input is not valid UTF-8 hex") from exc
+        return {"operation": op, "result": result, "encoding": "utf-8"}
+
+    if op == "url_encode":
+        return {"operation": op, "result": quote(value, safe=""), "encoding": "percent"}
+
+    if op == "url_decode":
+        return {"operation": op, "result": unquote(value), "encoding": "utf-8"}
+
+    if op == "jwt_decode":
+        parts = value.strip().split(".")
+        if len(parts) != 3:
+            raise ToolError(422, "JWT must contain exactly three dot-separated segments")
+        try:
+            def _decode_part(part: str) -> Any:
+                padded = part + "=" * (-len(part) % 4)
+                return json.loads(_base64.urlsafe_b64decode(padded).decode("utf-8"))
+            header = _decode_part(parts[0])
+            payload = _decode_part(parts[1])
+        except Exception as exc:
+            raise ToolError(422, "JWT header or payload is not valid Base64URL JSON") from exc
+        return {
+            "operation": op,
+            "header": header,
+            "payload": payload,
+            "signature_present": bool(parts[2]),
+            "verified": False,
+            "warning": "Decoded only; signature and claims were not verified.",
+        }
+
+    raise ToolError(
+        400,
+        "Unsupported operation. Use sha256, sha512, sha1, md5, blake2b, "
+        "base64_encode, base64_decode, base64url_decode, hex_encode, hex_decode, "
+        "url_encode, url_decode, or jwt_decode.",
+    )
