@@ -173,12 +173,11 @@ async def _outcome_backfill_loop():
 
 # --- App ---
 app = FastAPI(
-    title="SolSignal API",
+    title="CIPHER Agent Tools",
     description=(
-        "Solana Token Safety Scanner — aggregates DexScreener, RugCheck, GoPlus, "
-        "and Jupiter simulation into a single SAFE/CAUTION/AVOID/RUG verdict. "
-        "Plus experimental 646-agent scoring. "
-        "Pay per request via x402 (USDC on Solana) or API key."
+        "Machine-payable utilities for AI agents: DeFi data, GitHub repo preflight, "
+        "URL/PDF extraction, JSON repair, and SolSignal token safety. "
+        "Pay per request via x402 v2 in USDC on Solana."
     ),
     version="2.0.0",
     docs_url="/docs",
@@ -442,7 +441,7 @@ async def _build_402(resource: str, price_key: str) -> Response:
             url=f"{PUBLIC_BASE_URL}{resource}",
             description=f"SolSignal paid API: {price_key}",
             mime_type="application/json",
-            service_name="SolSignal",
+            service_name="CIPHER Agent Tools",
             tags=["solana", "token-safety", "crypto"],
         ),
         error="Payment required",
@@ -546,8 +545,8 @@ def _query_db(db_path: str, sql: str, params: tuple = ()) -> list[dict]:
 async def root():
     configs = _load_boost_configs()
     return {
-        "name": "SolSignal API",
-        "tagline": "Solana Token Safety Scanner — 4 sources, 1 verdict, <2 seconds.",
+        "name": "CIPHER Agent Tools",
+        "tagline": "Low-cost machine-payable utilities for AI agents, settled in USDC on Solana.",
         "version": "2.0.0",
         "endpoints": {
             "## Safety Scanner (PRIMARY)": "---",
@@ -1117,9 +1116,8 @@ async def x402_manifest():
         "x402Version": 2,
         "name": "SolSignal API",
         "description": (
-            "Solana Token Safety Scanner — aggregates DexScreener, RugCheck, GoPlus, "
-            "and Jupiter simulation into one SAFE/CAUTION/AVOID/RUG verdict in <2 seconds. "
-            "Plus experimental 646-agent scoring."
+            "Machine-payable utilities for AI agents: DeFi data, GitHub repo preflight, "
+            "URL/PDF extraction, JSON repair, plus SolSignal token safety."
         ),
         "homepage": "https://github.com/cryptomotifs/solsignal-api",
         "network": SOLANA_NETWORK,
@@ -1246,20 +1244,19 @@ async def ai_plugin():
     """OpenAI-compatible plugin manifest — used by AI agent frameworks for discovery."""
     return {
         "schema_version": "v1",
-        "name_for_human": "SolSignal",
-        "name_for_model": "solsignal",
+        "name_for_human": "CIPHER Agent Tools",
+        "name_for_model": "cipher_agent_tools",
         "description_for_human": (
-            "Solana Token Safety Scanner — scan any token for honeypots, rug pulls, "
-            "and scams. Plus experimental 646-agent trading signals."
+            "Machine-payable AI-agent utilities for DeFi data, developer preflight, "
+            "document extraction, JSON repair, and Solana token safety."
         ),
         "description_for_model": (
-            "Solana token safety scanner. /scan/{mint} aggregates 4 free security sources "
-            "(DexScreener, RugCheck, GoPlus, Jupiter simulation) into a single "
-            "SAFE/CAUTION/AVOID/RUG verdict in under 2 seconds. Returns safety_score (0-100), "
-            "individual checks (honeypot, sell_tax, lp_locked, mintable, holder_concentration, "
-            "liquidity, age), and risk_flags. /trending returns safety-screened trending tokens. "
-            "/track/stats shows public accuracy record. Free tier: 10 scans/day. "
-            "Also supports x402 USDC payments and API key auth."
+            "Use CIPHER Agent Tools for machine-payable utilities. /tools/defi/yields and "
+            "/tools/defi/protocols normalize DeFi data; /tools/repo/preflight checks public "
+            "GitHub repository maintenance and license signals; /tools/url/read and "
+            "/tools/pdf/markdown create agent-readable context; /tools/json/repair fixes common "
+            "malformed model JSON; /scan/{mint} provides Solana token safety. Paid calls use "
+            "x402 v2 USDC on Solana."
         ),
         "auth": {"type": "none"},
         "api": {
@@ -1276,13 +1273,13 @@ async def ai_plugin():
 async def agent_manifest():
     """Solana Agent Protocol discovery — for agent-to-agent communication."""
     return {
-        "name": "SolSignal",
+        "name": "CIPHER Agent Tools",
         "description": (
-            "Solana Token Safety Scanner — aggregates 4 sources into one verdict. "
-            "Plus 646 AI agents providing experimental trading signals."
+            "Machine-payable utilities for AI agents, including DeFi data, developer "
+            "preflight, document extraction, JSON repair, and SolSignal token safety."
         ),
-        "url": "https://solsignal-api.onrender.com",
-        "documentationUrl": "https://solsignal-api.onrender.com/docs",
+        "url": PUBLIC_BASE_URL,
+        "documentationUrl": f"{PUBLIC_BASE_URL}/docs",
         "capabilities": [
             "token-safety-scan",
             "honeypot-detection",
