@@ -774,10 +774,12 @@ async def tool_defi_protocols(
 
 
 @app.get("/tools/repo/preflight")
-async def tool_repo_preflight(request: Request, repo: str):
+async def tool_repo_preflight(request: Request, repo: str | None = None):
     block = await _gate(request, _paid_resource(request), "tool_repo")
     if block:
         return block
+    if not repo:
+        return JSONResponse(status_code=400, content={"error": "repo is required"})
     try:
         from agent_tools import ToolError, repo_preflight
         return await repo_preflight(
@@ -789,10 +791,16 @@ async def tool_repo_preflight(request: Request, repo: str):
 
 
 @app.post("/tools/url/read")
-async def tool_url_read(request: Request, payload: dict[str, Any]):
+async def tool_url_read(request: Request):
     block = await _gate(request, request.url.path, "tool_url")
     if block:
         return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
     url = str(payload.get("url") or "").strip()
     if not url:
         return JSONResponse(status_code=400, content={"error": "url is required"})
@@ -806,10 +814,16 @@ async def tool_url_read(request: Request, payload: dict[str, Any]):
 
 
 @app.post("/tools/pdf/markdown")
-async def tool_pdf_markdown(request: Request, payload: dict[str, Any]):
+async def tool_pdf_markdown(request: Request):
     block = await _gate(request, request.url.path, "tool_pdf")
     if block:
         return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
     url = str(payload.get("url") or "").strip()
     if not url:
         return JSONResponse(status_code=400, content={"error": "url is required"})
@@ -830,10 +844,16 @@ async def tool_pdf_markdown(request: Request, payload: dict[str, Any]):
 
 
 @app.post("/tools/json/repair")
-async def tool_json_repair(request: Request, payload: dict[str, Any]):
+async def tool_json_repair(request: Request):
     block = await _gate(request, request.url.path, "tool_json")
     if block:
         return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
     raw = payload.get("text")
     if not isinstance(raw, str) or not raw:
         return JSONResponse(
@@ -1108,6 +1128,24 @@ async def live_score(request: Request, mint: str, top_n: int = 20):
 # =========================================================================
 # AUTO-DISCOVERY ENDPOINTS
 # =========================================================================
+
+@app.get("/.well-known/x402")
+async def x402_compat_manifest():
+    """Compatibility discovery document for x402 registries/crawlers."""
+    base = PUBLIC_BASE_URL
+    return {
+        "version": 1,
+        "resources": [
+            f"{base}/tools/defi/yields",
+            f"{base}/tools/defi/protocols",
+            f"{base}/tools/repo/preflight",
+            f"{base}/tools/url/read",
+            f"{base}/tools/pdf/markdown",
+            f"{base}/tools/json/repair",
+            f"{base}/scan/{{mint}}",
+        ],
+    }
+
 
 @app.get("/.well-known/x402.json")
 async def x402_manifest():
