@@ -364,15 +364,15 @@ def _payment_stats() -> dict[str, Any]:
             "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_atomic), 0) AS total FROM settlements"
         ).fetchone()
         recent = []
-        for r in conn.execute(
-                """
-                SELECT tx_signature, endpoint, amount_usdc, payer, network, facilitator, settled_at
-                FROM settlements
-                ORDER BY settled_at DESC
-                LIMIT 20
-                """
-            ).fetchall()
-        :
+        recent_rows = conn.execute(
+            """
+            SELECT tx_signature, endpoint, amount_usdc, payer, network, facilitator, settled_at
+            FROM settlements
+            ORDER BY settled_at DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        for r in recent_rows:
             item = dict(r)
             item["transaction"] = item.pop("tx_signature")
             recent.append(item)
