@@ -302,7 +302,7 @@ def _init_payments_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS settlements (
-                transaction TEXT PRIMARY KEY,
+                tx_signature TEXT PRIMARY KEY,
                 endpoint TEXT NOT NULL,
                 amount_atomic INTEGER NOT NULL,
                 amount_usdc REAL NOT NULL,
@@ -335,7 +335,7 @@ def _record_settlement(
         conn.execute(
             """
             INSERT OR IGNORE INTO settlements
-            (transaction, endpoint, amount_atomic, amount_usdc, payer, network, facilitator, settled_at)
+            (tx_signature, endpoint, amount_atomic, amount_usdc, payer, network, facilitator, settled_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -363,17 +363,19 @@ def _payment_stats() -> dict[str, Any]:
         row = conn.execute(
             "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_atomic), 0) AS total FROM settlements"
         ).fetchone()
-        recent = [
-            dict(r)
-            for r in conn.execute(
+        recent = []
+        for r in conn.execute(
                 """
-                SELECT transaction, endpoint, amount_usdc, payer, network, facilitator, settled_at
+                SELECT tx_signature, endpoint, amount_usdc, payer, network, facilitator, settled_at
                 FROM settlements
                 ORDER BY settled_at DESC
                 LIMIT 20
                 """
             ).fetchall()
-        ]
+        :
+            item = dict(r)
+            item["transaction"] = item.pop("tx_signature")
+            recent.append(item)
     finally:
         conn.close()
 
