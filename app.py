@@ -65,6 +65,7 @@ PRICES = {
     "agent": 5000,           # $0.005
     "analysis": 50000,       # $0.05
     "bulk": 100000,          # $0.10
+    "tool_ping": 1000,        # $0.001
     "tool_json": 1000,        # $0.001
     "tool_url": 3000,         # $0.003
     "tool_defi": 3000,        # $0.003
@@ -562,6 +563,7 @@ async def root():
             "/signals/bulk": "$0.10 — All scores for all recent tokens",
             "## CIPHER Agent Tools": "---",
             "/tools/catalog": "Free — machine-readable paid-tool catalog",
+            "/tools/x402/ping": "$0.001 — end-to-end x402 payment-path check",
             "/skill.md": "Free — agent-facing capability/payment contract",
             "/tools/defi/yields": "$0.003 — normalized/filterable DeFi yield data",
             "/tools/defi/protocols": "$0.003 — normalized/filterable DeFi protocol data",
@@ -676,6 +678,12 @@ async def tools_catalog():
         "recipient": SOLANA_WALLET or None,
         "tools": [
             {
+                "path": "/tools/x402/ping",
+                "method": "GET",
+                "price_usdc": 0.001,
+                "use_case": "Low-cost end-to-end x402 payment-path check; successful responses carry PAYMENT-RESPONSE settlement proof.",
+            },
+            {
                 "path": "/tools/defi/yields",
                 "method": "GET",
                 "price_usdc": 0.003,
@@ -722,6 +730,22 @@ def _paid_resource(request: Request) -> str:
     if request.url.query:
         return f"{request.url.path}?{request.url.query}"
     return request.url.path
+
+
+@app.get("/tools/x402/ping")
+async def tool_x402_ping(request: Request):
+    block = await _gate(request, request.url.path, "tool_ping")
+    if block:
+        return block
+    return {
+        "ok": True,
+        "service": "CIPHER Agent Tools",
+        "purpose": "x402 payment path verified",
+        "network": SOLANA_NETWORK,
+        "asset": "USDC",
+        "recipient": SOLANA_WALLET,
+        "note": "Read the PAYMENT-RESPONSE header for settlement proof.",
+    }
 
 
 @app.get("/tools/defi/yields")
@@ -897,6 +921,7 @@ Use these endpoints when your agent needs normalized data or deterministic utili
 
 | Tool | Method | Price | Use when |
 |---|---|---:|---|
+| `/tools/x402/ping` | GET | $0.001 | Prove the agent's x402 wallet/payment path works end to end. |
 | `/tools/defi/yields` | GET | $0.003 | Filter current DeFi yield pools by chain, token, TVL, APY, or stablecoin flag. |
 | `/tools/defi/protocols` | GET | $0.003 | Rank/filter protocols by chain, category, and TVL. |
 | `/tools/repo/preflight` | GET | $0.01 | Check a public GitHub repo's maintenance, license, CI, security policy, and integration-risk signals. |
@@ -949,6 +974,7 @@ Free discovery:
 - GET /revenue
 
 Paid tools:
+- GET /tools/x402/ping — $0.001
 - GET /tools/defi/yields — $0.003
 - GET /tools/defi/protocols — $0.003
 - GET /tools/repo/preflight — $0.01
@@ -1204,6 +1230,7 @@ async def x402_compat_manifest():
     return {
         "version": 1,
         "resources": [
+            f"{base}/tools/x402/ping",
             f"{base}/tools/defi/yields",
             f"{base}/tools/defi/protocols",
             f"{base}/tools/repo/preflight",
@@ -1231,6 +1258,14 @@ async def x402_manifest():
         "payTo": SOLANA_WALLET or "not_configured",
         "facilitator": X402_FACILITATOR,
         "endpoints": [
+            {
+                "path": "/tools/x402/ping",
+                "method": "GET",
+                "description": "Low-cost x402 payment-path check",
+                "amount": str(PRICES["tool_ping"]),
+                "currency": "USDC",
+                "priceUsd": "$0.001",
+            },
             {
                 "path": "/scan/{mint}",
                 "method": "GET",
