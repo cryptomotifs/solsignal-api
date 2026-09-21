@@ -239,6 +239,11 @@ async def settle_verified_x402(request: Request, call_next):
         network=settle_result.network,
     )
     response.headers["PAYMENT-RESPONSE"] = encode_payment_response_header(settle_result)
+    existing_cache = response.headers.get("Cache-Control", "")
+    if "private" not in existing_cache.lower():
+        response.headers["Cache-Control"] = (
+            f"{existing_cache}, private".strip(", ") if existing_cache else "private"
+        )
     return response
 
 
@@ -451,7 +456,10 @@ async def _build_402(resource: str, price_key: str) -> Response:
     return JSONResponse(
         status_code=402,
         content=payload,
-        headers={"PAYMENT-REQUIRED": encode_payment_required_header(payment_required)},
+        headers={
+            "PAYMENT-REQUIRED": encode_payment_required_header(payment_required),
+            "Cache-Control": "no-store",
+        },
     )
 
 
