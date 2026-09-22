@@ -1307,3 +1307,441 @@ async def mcp_registry_doctor(
             "Authentication/namespace ownership failures can still occur at publish time."
         ),
     }
+
+
+
+def _www_authenticate_param(value: str, name: str) -> str | None:
+    if not value:
+        return None
+    match = re.search(
+        rf'(?:^|[,\s]){re.escape(name)}\s*=\s*"([^"]+)"',
+        value,
+        re.I,
+    )
+    if match:
+        return match.group(1).strip()
+    match = re.search(
+        rf'(?:^|[,\s]){re.escape(name)}\s*=\s*([^,\s]+)',
+        value,
+        re.I,
+    )
+    return match.group(1).strip() if match else None
+
+
+def _oauth_metadata_candidates(issuer: str) -> list[str]:
+    parsed = urlparse(issuer)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+    candidates = []
+    if path:
+        candidates.append(origin + "/.well-known/oauth-authorization-server" + path)
+        candidates.append(origin + path + "/.well-known/openid-configuration")
+    candidates.append(origin + "/.well-known/oauth-authorization-server")
+    candidates.append(origin + "/.well-known/openid-configuration")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return ordered
+
+
+async def _fetch_json_document(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any] | None, int | None, str]:
+    try:
+        response, body, final_url = await _bounded_request(
+            client,
+            "GET",
+            url,
+            headers={
+                "User-Agent": "CIPHER-MCP-OAuth-Doctor/1.0",
+                "Accept": "application/json",
+            },
+            timeout_seconds=timeout_seconds,
+        )
+    except ToolError:
+        return None, None, url
+
+    if response.status_code != 200:
+        return None, response.status_code, final_url
+    try:
+        parsed = json.loads(body.decode("utf-8", errors="replace"))
+    except Exception:
+        return None, response.status_code, final_url
+    return (parsed if isinstance(parsed, dict) else None), response.status_code, final_url
+
+
+async def mcp_oauth_doctor(
+    url: str,
+    *,
+    timeout_seconds: float = 12.0,
+) -> dict[str, Any]:
+    """Audit MCP OAuth discovery without requesting credentials or tokens."""
+    _validate_public_url(url)
+    timeout_seconds = min(max(float(timeout_seconds), 3.0), 30.0)
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path or "/"
+    started = time.perf_counter()
+
+    findings: list[dict[str, str]] = []
+    headers = {
+        "User-Agent": "CIPHER-MCP-OAuth-Doctor/1.0",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "CIPHER OAuth Doctor", "version": "1.0"},
+        },
+    }
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=timeout_seconds) as client:
+        response, _, final_url = await _bounded_request(
+            client,
+            "POST",
+            url,
+            headers=headers,
+            json_body=initialize,
+            timeout_seconds=timeout_seconds,
+        )
+        www_authenticate = response.headers.get("www-authenticate", "")
+        header_metadata_url = _www_authenticate_param(
+            www_authenticate,
+            "resource_metadata",
+        )
+        header_scope = _www_authenticate_param(www_authenticate, "scope")
+
+        candidate_urls: list[str] = []
+        if header_metadata_url:
+            candidate_urls.append(header_metadata_url)
+
+        path_suffix = path if path.startswith("/") else "/" + path
+        if path_suffix != "/":
+            candidate_urls.append(
+                origin + "/.well-known/oauth-protected-resource" + path_suffix
+            )
+        candidate_urls.append(origin + "/.well-known/oauth-protected-resource")
+
+        seen: set[str] = set()
+        prm_url = None
+        prm = None
+        prm_status = None
+        for candidate in candidate_urls:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                _validate_public_url(candidate)
+            except ToolError:
+                findings.append(
+                    {
+                        "severity": "error",
+                        "code": "INVALID_RESOURCE_METADATA_URL",
+                        "message": "Protected-resource metadata URL is not a valid public HTTP(S) URL.",
+                    }
+                )
+                continue
+            document, status, discovered_url = await _fetch_json_document(
+                client,
+                candidate,
+                timeout_seconds=timeout_seconds,
+            )
+            if document is not None:
+                prm = document
+                prm_url = discovered_url
+                prm_status = status
+                break
+
+        if response.status_code == 401 and not header_metadata_url:
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "WWW_AUTHENTICATE_RESOURCE_METADATA_MISSING",
+                    "message": (
+                        "401 challenge did not advertise resource_metadata; clients must rely "
+                        "on RFC 9728 well-known fallback discovery."
+                    ),
+                }
+            )
+        elif response.status_code not in {401, 403}:
+            findings.append(
+                {
+                    "severity": "info",
+                    "code": "INITIAL_REQUEST_NOT_AUTH_CHALLENGED",
+                    "message": (
+                        f"Initial MCP request returned HTTP {response.status_code}; "
+                        "the endpoint may be public or use a different authorization gate."
+                    ),
+                }
+            )
+
+        if prm is None:
+            findings.append(
+                {
+                    "severity": "error",
+                    "code": "PROTECTED_RESOURCE_METADATA_NOT_FOUND",
+                    "message": "No usable RFC 9728 protected-resource metadata document was found.",
+                }
+            )
+            return {
+                "url": final_url,
+                "status": "FAIL",
+                "initial_http_status": response.status_code,
+                "www_authenticate_present": bool(www_authenticate),
+                "resource_metadata_url": None,
+                "findings": findings,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                "credentials_requested": False,
+                "tokens_requested": False,
+            }
+
+        resource_value = prm.get("resource")
+        if resource_value != final_url and resource_value != url:
+            findings.append(
+                {
+                    "severity": "error",
+                    "code": "RESOURCE_IDENTIFIER_MISMATCH",
+                    "message": (
+                        "Protected-resource metadata resource value does not exactly match "
+                        "the MCP resource URL."
+                    ),
+                }
+            )
+
+        authorization_servers = prm.get("authorization_servers")
+        if not isinstance(authorization_servers, list) or not authorization_servers:
+            findings.append(
+                {
+                    "severity": "error",
+                    "code": "AUTHORIZATION_SERVERS_MISSING",
+                    "message": "Protected-resource metadata has no authorization_servers entry.",
+                }
+            )
+            authorization_servers = []
+
+        server_results: list[dict[str, Any]] = []
+        for issuer in authorization_servers[:5]:
+            if not isinstance(issuer, str):
+                continue
+            metadata = None
+            metadata_url = None
+            metadata_status = None
+            try:
+                _validate_public_url(issuer)
+            except ToolError:
+                server_results.append(
+                    {
+                        "issuer": issuer,
+                        "metadata_found": False,
+                        "error": "issuer_not_public_https_or_http",
+                    }
+                )
+                continue
+
+            for candidate in _oauth_metadata_candidates(issuer):
+                document, status, discovered_url = await _fetch_json_document(
+                    client,
+                    candidate,
+                    timeout_seconds=timeout_seconds,
+                )
+                if document is not None:
+                    metadata = document
+                    metadata_url = discovered_url
+                    metadata_status = status
+                    break
+
+            if metadata is None:
+                findings.append(
+                    {
+                        "severity": "error",
+                        "code": "AUTH_SERVER_METADATA_NOT_FOUND",
+                        "message": f"No OAuth/OIDC metadata found for authorization server {issuer}.",
+                    }
+                )
+                server_results.append(
+                    {
+                        "issuer": issuer,
+                        "metadata_found": False,
+                        "metadata_status": metadata_status,
+                    }
+                )
+                continue
+
+            missing = [
+                field
+                for field in ("authorization_endpoint", "token_endpoint")
+                if not metadata.get(field)
+            ]
+            if missing:
+                findings.append(
+                    {
+                        "severity": "error",
+                        "code": "AUTH_SERVER_ENDPOINTS_MISSING",
+                        "message": (
+                            f"Authorization server {issuer} is missing required metadata: "
+                            + ", ".join(missing)
+                        ),
+                    }
+                )
+
+            pkce = metadata.get("code_challenge_methods_supported")
+            if isinstance(pkce, list) and "S256" not in pkce:
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "PKCE_S256_NOT_ADVERTISED",
+                        "message": f"Authorization server {issuer} does not advertise PKCE S256.",
+                    }
+                )
+
+            server_results.append(
+                {
+                    "issuer": issuer,
+                    "metadata_found": True,
+                    "metadata_url": metadata_url,
+                    "authorization_endpoint": metadata.get("authorization_endpoint"),
+                    "token_endpoint": metadata.get("token_endpoint"),
+                    "registration_endpoint": metadata.get("registration_endpoint"),
+                    "dynamic_client_registration_available": bool(
+                        metadata.get("registration_endpoint")
+                    ),
+                    "scopes_supported": metadata.get("scopes_supported"),
+                    "code_challenge_methods_supported": pkce,
+                }
+            )
+
+    severities = {item["severity"] for item in findings}
+    status = "FAIL" if "error" in severities else "WARN" if "warning" in severities else "PASS"
+    return {
+        "url": final_url,
+        "status": status,
+        "initial_http_status": response.status_code,
+        "www_authenticate_present": bool(www_authenticate),
+        "www_authenticate_scope": header_scope,
+        "resource_metadata_url": prm_url,
+        "resource_metadata_http_status": prm_status,
+        "resource_metadata": {
+            "resource": prm.get("resource"),
+            "authorization_servers": authorization_servers,
+            "scopes_supported": prm.get("scopes_supported"),
+        },
+        "authorization_servers": server_results,
+        "findings": findings,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        "credentials_requested": False,
+        "tokens_requested": False,
+        "note": (
+            "Discovery/configuration audit only. CIPHER does not register OAuth clients, "
+            "open user authorization pages, request access tokens, or collect credentials."
+        ),
+    }
+
+
+def _x402_challenge_fingerprint(challenge: dict[str, Any]) -> str:
+    normalized = {
+        "x402_version": challenge.get("x402_version"),
+        "resource": challenge.get("resource"),
+        "requirements": challenge.get("requirements") or [],
+    }
+    raw = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+async def x402_prepay_verify(
+    url: str,
+    *,
+    policy: dict[str, Any],
+    method: str = "auto",
+    body: dict[str, Any] | None = None,
+    timeout_seconds: float = 12.0,
+) -> dict[str, Any]:
+    """Re-fetch x402 terms and apply caller policy before any payment is signed."""
+    if not isinstance(policy, dict):
+        raise ToolError(400, "policy must be a JSON object")
+
+    first = await audit_x402_endpoint(
+        url,
+        method=method,
+        body=body,
+        timeout_seconds=timeout_seconds,
+    )
+    first_challenge = first.get("challenge")
+    if not isinstance(first_challenge, dict) or not first_challenge.get("challenge_found"):
+        return {
+            "approved": False,
+            "decision": "REJECT",
+            "reason": "NO_VALID_402_CHALLENGE",
+            "first_probe": first,
+            "payment_signed": False,
+            "payment_settled": False,
+        }
+
+    second = await audit_x402_endpoint(
+        url,
+        method=first.get("paid_method") or method,
+        body=body,
+        timeout_seconds=timeout_seconds,
+    )
+    second_challenge = second.get("challenge")
+    if not isinstance(second_challenge, dict) or not second_challenge.get("challenge_found"):
+        return {
+            "approved": False,
+            "decision": "REJECT",
+            "reason": "CHALLENGE_DISAPPEARED_ON_REFETCH",
+            "first_probe": first,
+            "second_probe": second,
+            "payment_signed": False,
+            "payment_settled": False,
+        }
+
+    first_fp = _x402_challenge_fingerprint(first_challenge)
+    second_fp = _x402_challenge_fingerprint(second_challenge)
+    consistent = first_fp == second_fp
+
+    policy_result = evaluate_payment_policy(
+        second_challenge.get("payload") or second_challenge,
+        policy,
+    )
+
+    reasons: list[str] = []
+    if not consistent:
+        reasons.append("PAYMENT_TERMS_CHANGED_BETWEEN_FETCHES")
+    if not policy_result.get("approved"):
+        reasons.append("POLICY_REJECTED_PAYMENT")
+
+    approved = consistent and bool(policy_result.get("approved"))
+    return {
+        "approved": approved,
+        "decision": "APPROVE" if approved else "REJECT",
+        "reasons": reasons,
+        "challenge_consistent": consistent,
+        "first_challenge_fingerprint": first_fp,
+        "second_challenge_fingerprint": second_fp,
+        "terms": policy_result.get("terms"),
+        "policy": policy_result,
+        "runtime_discovery_status": second.get("status"),
+        "paid_method": second.get("paid_method"),
+        "payment_signed": False,
+        "payment_settled": False,
+        "note": (
+            "Verify-before-pay only. CIPHER re-fetches the live payment terms and applies "
+            "the caller's constraints but never receives or uses a private key."
+        ),
+    }

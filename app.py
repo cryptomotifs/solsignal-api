@@ -94,6 +94,8 @@ PRICES = {
     "tool_x402_bulk": 50000,    # $0.05
     "tool_agent_preflight": 25000, # $0.025
     "tool_registry_doctor": 10000, # $0.01
+    "tool_mcp_oauth_doctor": 10000, # $0.01
+    "tool_x402_prepay": 5000,       # $0.005
 }
 
 
@@ -111,6 +113,8 @@ def _paid_endpoint_catalog() -> list[dict[str, Any]]:
         ("/tools/x402/bulk", "POST", "Bulk cold-probe and discovery audit for up to 10 x402 endpoints without paying", "tool_x402_bulk"),
         ("/tools/agent/adoption-preflight", "POST", "Combined GitHub, MCP, and x402 evidence bundle for agent integration decisions", "tool_agent_preflight"),
         ("/tools/mcp/registry-doctor", "POST", "Validate server.json against the official MCP Registry schema and optionally live-probe remotes", "tool_registry_doctor"),
+        ("/tools/mcp/oauth-doctor", "POST", "Audit MCP OAuth/RFC 9728 protected-resource and authorization-server discovery without credentials", "tool_mcp_oauth_doctor"),
+        ("/tools/x402/prepay-verify", "POST", "Re-fetch x402 payment terms and enforce budget/network/asset/recipient/origin policy before payment", "tool_x402_prepay"),
         ("/tools/url/read", "POST", "Convert a public HTML or text URL into compact agent-readable Markdown plus links", "tool_url"),
         ("/tools/pdf/markdown", "POST", "Extract a public PDF text layer into page-structured Markdown", "tool_pdf"),
         ("/tools/json/repair", "POST", "Repair common malformed LLM JSON without another model call", "tool_json"),
@@ -228,6 +232,30 @@ def _bazaar_extensions(resource: str, price_key: str) -> dict[str, Any]:
             input_schema = {
                 "properties": {"text": {"type": "string"}},
                 "required": ["text"],
+            }
+        elif template == "/tools/mcp/oauth-doctor":
+            input_example = {"url": "https://example.com/mcp"}
+            input_schema = {
+                "properties": {
+                    "url": {"type": "string", "format": "uri"},
+                    "timeout_seconds": {"type": "number"},
+                },
+                "required": ["url"],
+            }
+        elif template == "/tools/x402/prepay-verify":
+            input_example = {
+                "url": "https://example.com/paid-tool",
+                "policy": {"max_amount_usdc": 0.05},
+            }
+            input_schema = {
+                "properties": {
+                    "url": {"type": "string", "format": "uri"},
+                    "method": {"type": "string"},
+                    "body": {"type": "object"},
+                    "policy": {"type": "object"},
+                    "timeout_seconds": {"type": "number"},
+                },
+                "required": ["url", "policy"],
             }
         elif template == "/tools/transform":
             input_example = {"operation": "sha256", "value": "hello"}
@@ -535,6 +563,16 @@ async def settle_verified_x402(request: Request, call_next):
         payer=settle_result.payer,
         network=settle_result.network,
     )
+    print(json.dumps({
+        "event": "x402_settlement",
+        "transaction": settle_result.transaction,
+        "endpoint": getattr(request.state, "x402_endpoint", request.url.path),
+        "amount_atomic": amount_atomic,
+        "amount_usdc": amount_atomic / 1_000_000,
+        "payer": settle_result.payer,
+        "network": settle_result.network,
+        "facilitator": X402_FACILITATOR,
+    }, default=str))
     response.headers["PAYMENT-RESPONSE"] = encode_payment_response_header(settle_result)
     existing_cache = response.headers.get("Cache-Control", "")
     if "private" not in existing_cache.lower():
@@ -1321,6 +1359,62 @@ async def tool_agent_adoption_preflight(request: Request):
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
+@app.post("/tools/mcp/oauth-doctor")
+async def tool_mcp_oauth_doctor(request: Request):
+    block = await _gate(request, request.url.path, "tool_mcp_oauth_doctor")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
+        return JSONResponse(status_code=400, content={"error": "url is required"})
+    try:
+        from agent_infra_tools import mcp_oauth_doctor
+        from agent_tools import ToolError
+        return await mcp_oauth_doctor(
+            payload["url"],
+            timeout_seconds=float(payload.get("timeout_seconds", 12.0)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "invalid timeout_seconds"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/x402/prepay-verify")
+async def tool_x402_prepay_verify(request: Request):
+    block = await _gate(request, request.url.path, "tool_x402_prepay")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
+    if not isinstance(payload.get("url"), str) or not isinstance(payload.get("policy"), dict):
+        return JSONResponse(status_code=400, content={"error": "url and policy are required"})
+    body = payload.get("body")
+    if body is not None and not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "body must be a JSON object"})
+    try:
+        from agent_infra_tools import x402_prepay_verify
+        from agent_tools import ToolError
+        return await x402_prepay_verify(
+            payload["url"],
+            policy=payload["policy"],
+            method=str(payload.get("method") or "auto"),
+            body=body,
+            timeout_seconds=float(payload.get("timeout_seconds", 12.0)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "invalid timeout_seconds"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
 @app.post("/tools/mcp/registry-doctor")
 async def tool_mcp_registry_doctor(request: Request):
     block = await _gate(request, request.url.path, "tool_registry_doctor")
@@ -1947,6 +2041,41 @@ def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
                 "probe_remote": {"type": "boolean", "default": True},
             },
             "required": ["server_json"],
+            "additionalProperties": False,
+        },
+        "/tools/mcp/oauth-doctor": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri", "example": "https://example.com/mcp"},
+                "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        "/tools/x402/prepay-verify": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri", "example": "https://example.com/paid-tool"},
+                "method": {"type": "string", "enum": ["auto", "GET", "POST", "PUT", "PATCH", "DELETE"], "default": "auto"},
+                "body": {"type": "object"},
+                "policy": {
+                    "type": "object",
+                    "properties": {
+                        "max_amount_usdc": {"type": "number"},
+                        "max_amount_atomic": {"type": "integer"},
+                        "allowed_networks": {"type": "array", "items": {"type": "string"}},
+                        "allowed_assets": {"type": "array", "items": {"type": "string"}},
+                        "allowed_pay_to": {"type": "array", "items": {"type": "string"}},
+                        "allowed_schemes": {"type": "array", "items": {"type": "string"}},
+                        "allowed_origins": {"type": "array", "items": {"type": "string"}},
+                        "expected_pay_to": {"type": "string"},
+                        "max_timeout_seconds": {"type": "integer"},
+                        "require_https_resource": {"type": "boolean", "default": True},
+                    },
+                },
+                "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
+            },
+            "required": ["url", "policy"],
             "additionalProperties": False,
         },
         "/tools/transform": {
