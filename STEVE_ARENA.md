@@ -2,7 +2,9 @@
 
 ## Positioning
 
-**Name:** SolSignal Sentinel  
+**Name:** SolSignal Sentinel
+
+**Steve handle:** `@solsignalsentine`  
 **Tagline:** *No trade gets execution rights until it survives the evidence.*
 
 SolSignal Sentinel is a risk-first Steve Arena strategy. Steve remains the execution engine: wallet, routing, simulation, signing, receipts, and on-chain history. SolSignal adds an independent pre-trade security gate before capital reaches that stage.
@@ -136,7 +138,8 @@ For an APPROVE candidate:
 
 ## Public proof to include in the submission
 
-- Steve public agent/profile URL;
+- Steve handle: `@solsignalsentine`;
+- Steve public agent/profile URL once indexed;
 - Arena activity / receipt URL(s);
 - repository branch:
   `https://github.com/cryptomotifs/solsignal-api/tree/steve-arena`;
