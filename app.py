@@ -105,6 +105,9 @@ PRICES = {
     "tool_solana_rent": 1000,         # $0.001
     "tool_solana_account": 1000,      # $0.001
     "tool_solana_message_fee": 2000,  # $0.002
+    "tool_solana_tx_status": 1000,    # $0.001
+    "tool_solana_simulate": 5000,     # $0.005
+    "tool_solana_forensics": 10000,   # $0.01
 }
 
 
@@ -133,6 +136,9 @@ def _paid_endpoint_catalog() -> list[dict[str, Any]]:
         ("/tools/solana/rent", "POST", "Minimum rent-exempt balance for a Solana account data size", "tool_solana_rent"),
         ("/tools/solana/account", "POST", "Compact read-only metadata for a Solana account", "tool_solana_account"),
         ("/tools/solana/message-fee", "POST", "Calculate network fee for a base64 serialized Solana message without signing or submitting it", "tool_solana_message_fee"),
+        ("/tools/solana/tx-status", "POST", "Check Solana transaction confirmation status and success without scanning full history manually", "tool_solana_tx_status"),
+        ("/tools/solana/simulate", "POST", "Simulate a base64 Solana transaction read-only with optional blockhash replacement and inner instructions", "tool_solana_simulate"),
+        ("/tools/solana/tx-forensics", "POST", "Deterministic Solana transaction report with status, programs, instructions, balance deltas, logs, and compute usage", "tool_solana_forensics"),
         ("/tools/url/read", "POST", "Convert a public HTML or text URL into compact agent-readable Markdown plus links", "tool_url"),
         ("/tools/pdf/markdown", "POST", "Extract a public PDF text layer into page-structured Markdown", "tool_pdf"),
         ("/tools/json/repair", "POST", "Repair common malformed LLM JSON without another model call", "tool_json"),
@@ -347,6 +353,35 @@ def _bazaar_extensions(resource: str, price_key: str) -> dict[str, Any]:
             input_schema = {
                 "properties": {"message_base64": {"type": "string"}},
                 "required": ["message_base64"],
+            }
+        elif template == "/tools/solana/tx-status":
+            input_example = {"signature": "5" + "1" * 87}
+            input_schema = {
+                "properties": {
+                    "signature": {"type": "string"},
+                    "search_history": {"type": "boolean"},
+                },
+                "required": ["signature"],
+            }
+        elif template == "/tools/solana/simulate":
+            input_example = {
+                "transaction_base64": "AQ==",
+                "replace_recent_blockhash": True,
+                "inner_instructions": False,
+            }
+            input_schema = {
+                "properties": {
+                    "transaction_base64": {"type": "string"},
+                    "replace_recent_blockhash": {"type": "boolean"},
+                    "inner_instructions": {"type": "boolean"},
+                },
+                "required": ["transaction_base64"],
+            }
+        elif template == "/tools/solana/tx-forensics":
+            input_example = {"signature": "5" + "1" * 87}
+            input_schema = {
+                "properties": {"signature": {"type": "string"}},
+                "required": ["signature"],
             }
         elif template == "/tools/transform":
             input_example = {"operation": "sha256", "value": "hello"}
@@ -1698,6 +1733,70 @@ async def tool_solana_message_fee(request: Request):
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
+@app.post("/tools/solana/tx-status")
+async def tool_solana_tx_status(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_tx_status")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("signature"), str):
+        return JSONResponse(status_code=400, content={"error": "signature is required"})
+    try:
+        from solana_tools import solana_transaction_status
+        from agent_tools import ToolError
+        return await solana_transaction_status(
+            payload["signature"],
+            search_history=bool(payload.get("search_history", True)),
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/simulate")
+async def tool_solana_simulate(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_simulate")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("transaction_base64"), str):
+        return JSONResponse(status_code=400, content={"error": "transaction_base64 is required"})
+    try:
+        from solana_tools import solana_simulate_transaction
+        from agent_tools import ToolError
+        return await solana_simulate_transaction(
+            payload["transaction_base64"],
+            replace_recent_blockhash=bool(payload.get("replace_recent_blockhash", True)),
+            inner_instructions=bool(payload.get("inner_instructions", False)),
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/tx-forensics")
+async def tool_solana_tx_forensics(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_forensics")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("signature"), str):
+        return JSONResponse(status_code=400, content={"error": "signature is required"})
+    try:
+        from solana_tools import solana_transaction_forensics
+        from agent_tools import ToolError
+        return await solana_transaction_forensics(payload["signature"])
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
 @app.post("/tools/mcp/registry-doctor")
 async def tool_mcp_registry_doctor(request: Request):
     block = await _gate(request, request.url.path, "tool_registry_doctor")
@@ -1784,6 +1883,9 @@ Use these endpoints when your agent needs normalized data or deterministic utili
 | `/tools/solana/wallet` | POST | $0.003 | Read SOL/USDC balances and recent signatures for a wallet. |
 | `/tools/solana/token-balance` | POST | $0.002 | Read an SPL token balance for an owner/mint pair. |
 | `/tools/solana/tx-verify` | POST | $0.005 | Verify confirmed USDC recipient balance deltas for a Solana transaction. |
+| `/tools/solana/tx-status` | POST | $0.001 | Check processed/confirmed/finalized transaction status and success. |
+| `/tools/solana/simulate` | POST | $0.005 | Simulate an unsigned or signed base64 transaction without broadcasting it. |
+| `/tools/solana/tx-forensics` | POST | $0.01 | Inspect programs, parsed instructions, balance deltas, logs, fee, and compute usage. |
 | `/tools/solana/blockhash` | GET | $0.001 | Get a fresh confirmed blockhash and last-valid block height. |
 | `/tools/solana/priority-fees` | POST | $0.002 | Read recent priority-fee samples and p50/p75/p90 non-zero prices. |
 | `/tools/solana/rent` | POST | $0.001 | Calculate rent-exempt lamports for an account data length. |
@@ -2433,6 +2535,33 @@ def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
                 "message_base64": {"type": "string", "description": "Base64-encoded serialized Solana message."},
             },
             "required": ["message_base64"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/tx-status": {
+            "type": "object",
+            "properties": {
+                "signature": {"type": "string", "description": "Solana transaction signature."},
+                "search_history": {"type": "boolean", "default": True},
+            },
+            "required": ["signature"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/simulate": {
+            "type": "object",
+            "properties": {
+                "transaction_base64": {"type": "string", "description": "Base64-encoded serialized Solana transaction."},
+                "replace_recent_blockhash": {"type": "boolean", "default": True},
+                "inner_instructions": {"type": "boolean", "default": False},
+            },
+            "required": ["transaction_base64"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/tx-forensics": {
+            "type": "object",
+            "properties": {
+                "signature": {"type": "string", "description": "Confirmed or historical Solana transaction signature."},
+            },
+            "required": ["signature"],
             "additionalProperties": False,
         },
         "/tools/transform": {
