@@ -6,11 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy API code and data
-COPY app.py .
-COPY scoring.py .
-COPY scanner.py .
-COPY tracker.py .
+# Copy all root Python modules so newly added paid-tool implementations
+# cannot be omitted from the production image while still appearing in OpenAPI.
+COPY *.py .
 COPY data/ data/
 
 EXPOSE 8402
