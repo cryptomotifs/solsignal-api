@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import re
 import time
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
@@ -883,5 +884,426 @@ def evaluate_payment_policy(
         "note": (
             "Deterministic pre-payment policy evaluation only. "
             "CIPHER never needs the payer's private key."
+        ),
+    }
+
+
+_CURRENT_MCP_REGISTRY_SCHEMA = (
+    "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
+)
+_REGISTRY_SCHEMA_CACHE: dict[str, Any] = {}
+
+
+async def bulk_mcp_audit(
+    urls: list[str],
+    *,
+    timeout_seconds: float = 12.0,
+) -> dict[str, Any]:
+    """Audit up to 10 MCP endpoints with bounded concurrency."""
+    if not isinstance(urls, list) or not urls:
+        raise ToolError(400, "urls must be a non-empty list")
+    if len(urls) > 10:
+        raise ToolError(400, "A bulk MCP audit supports at most 10 URLs")
+    if any(not isinstance(url, str) or not url.strip() for url in urls):
+        raise ToolError(400, "Every MCP URL must be a non-empty string")
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def run(url: str) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                return await audit_mcp_server(
+                    url.strip(),
+                    timeout_seconds=timeout_seconds,
+                )
+            except ToolError as exc:
+                return {
+                    "url": url,
+                    "status": "ERROR",
+                    "error": exc.message,
+                    "http_status": exc.status_code,
+                }
+            except Exception as exc:
+                return {
+                    "url": url,
+                    "status": "ERROR",
+                    "error": type(exc).__name__,
+                }
+
+    results = await asyncio.gather(*(run(url) for url in urls))
+    healthy = sum(1 for item in results if item.get("status") == "HEALTHY")
+    review = sum(1 for item in results if item.get("status") == "REVIEW")
+    auth = sum(1 for item in results if str(item.get("status", "")).startswith("AUTH_REQUIRED"))
+    errors = len(results) - healthy - review - auth
+
+    return {
+        "count": len(results),
+        "summary": {
+            "healthy": healthy,
+            "review": review,
+            "auth_required": auth,
+            "other_or_error": errors,
+        },
+        "results": results,
+    }
+
+
+async def bulk_x402_audit(
+    urls: list[str],
+    *,
+    timeout_seconds: float = 12.0,
+) -> dict[str, Any]:
+    """Cold-probe up to 10 x402 endpoints without paying any of them."""
+    if not isinstance(urls, list) or not urls:
+        raise ToolError(400, "urls must be a non-empty list")
+    if len(urls) > 10:
+        raise ToolError(400, "A bulk x402 audit supports at most 10 URLs")
+    if any(not isinstance(url, str) or not url.strip() for url in urls):
+        raise ToolError(400, "Every x402 URL must be a non-empty string")
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def run(url: str) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                return await audit_x402_endpoint(
+                    url.strip(),
+                    method="auto",
+                    timeout_seconds=timeout_seconds,
+                )
+            except ToolError as exc:
+                return {
+                    "url": url,
+                    "status": "ERROR",
+                    "error": exc.message,
+                    "http_status": exc.status_code,
+                    "payment_attempted": False,
+                }
+            except Exception as exc:
+                return {
+                    "url": url,
+                    "status": "ERROR",
+                    "error": type(exc).__name__,
+                    "payment_attempted": False,
+                }
+
+    results = await asyncio.gather(*(run(url) for url in urls))
+    summary = {
+        "pass": sum(1 for item in results if item.get("status") == "PASS"),
+        "warn": sum(1 for item in results if item.get("status") == "WARN"),
+        "fail": sum(1 for item in results if item.get("status") == "FAIL"),
+        "error": sum(1 for item in results if item.get("status") == "ERROR"),
+    }
+    return {
+        "count": len(results),
+        "summary": summary,
+        "results": results,
+        "payment_attempted": False,
+    }
+
+
+async def agent_adoption_preflight(
+    *,
+    repo: str | None = None,
+    mcp_url: str | None = None,
+    x402_url: str | None = None,
+    timeout_seconds: float = 12.0,
+) -> dict[str, Any]:
+    """One-call adoption preflight combining repo, MCP, and x402 evidence."""
+    if not any((repo, mcp_url, x402_url)):
+        raise ToolError(400, "Provide at least one of repo, mcp_url, or x402_url")
+
+    tasks: dict[str, Any] = {}
+    if repo:
+        from agent_tools import repo_preflight
+
+        tasks["repository"] = repo_preflight(repo)
+    if mcp_url:
+        tasks["mcp"] = audit_mcp_server(
+            mcp_url,
+            timeout_seconds=timeout_seconds,
+        )
+    if x402_url:
+        tasks["x402"] = audit_x402_endpoint(
+            x402_url,
+            method="auto",
+            timeout_seconds=timeout_seconds,
+        )
+
+    keys = list(tasks)
+    gathered = await asyncio.gather(
+        *(tasks[key] for key in keys),
+        return_exceptions=True,
+    )
+
+    evidence: dict[str, Any] = {}
+    reasons: list[str] = []
+    fail = False
+    review = False
+
+    for key, value in zip(keys, gathered):
+        if isinstance(value, Exception):
+            message = (
+                value.message
+                if isinstance(value, ToolError)
+                else type(value).__name__
+            )
+            evidence[key] = {"status": "ERROR", "error": message}
+            reasons.append(f"{key}_audit_error")
+            review = True
+            continue
+
+        evidence[key] = value
+        if key == "repository":
+            recommendation = str(value.get("recommendation") or "")
+            if recommendation == "AVOID_OR_FORK":
+                fail = True
+                reasons.append("repository_archived_or_stale")
+            elif recommendation != "ADAPT_AFTER_TECHNICAL_REVIEW":
+                review = True
+                reasons.append("repository_requires_review")
+        elif key == "mcp":
+            status = str(value.get("status") or "")
+            if status in {"BROKEN_OR_NOT_MCP", "MCP_TOOLS_LIST_FAILED"}:
+                fail = True
+                reasons.append("mcp_unusable")
+            elif status != "HEALTHY":
+                review = True
+                reasons.append("mcp_requires_review")
+        elif key == "x402":
+            status = str(value.get("status") or "")
+            if status == "FAIL":
+                fail = True
+                reasons.append("x402_discovery_or_challenge_failure")
+            elif status != "PASS":
+                review = True
+                reasons.append("x402_requires_review")
+
+    decision = "REJECT" if fail else "REVIEW" if review else "ADOPT_CANDIDATE"
+    return {
+        "decision": decision,
+        "reasons": reasons,
+        "evidence": evidence,
+        "note": (
+            "This is an engineering preflight, not a guarantee of security, "
+            "correctness, profitability, or legal/license compatibility."
+        ),
+    }
+
+
+async def _load_registry_schema(schema_url: str) -> dict[str, Any]:
+    if schema_url in _REGISTRY_SCHEMA_CACHE:
+        return _REGISTRY_SCHEMA_CACHE[schema_url]
+
+    parsed = urlparse(schema_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "static.modelcontextprotocol.io"
+        or not parsed.path.endswith("/server.schema.json")
+    ):
+        raise ToolError(
+            400,
+            "Only official static.modelcontextprotocol.io server schemas are supported",
+        )
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=12.0) as client:
+        response, body, _ = await _bounded_request(
+            client,
+            "GET",
+            schema_url,
+            headers={
+                "User-Agent": "CIPHER-MCP-Registry-Doctor/1.0",
+                "Accept": "application/schema+json, application/json",
+            },
+            timeout_seconds=12.0,
+        )
+    if response.status_code != 200:
+        raise ToolError(
+            502,
+            f"Official MCP schema returned HTTP {response.status_code}",
+        )
+    try:
+        schema = json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        raise ToolError(502, "Official MCP schema was not valid JSON") from exc
+    if not isinstance(schema, dict):
+        raise ToolError(502, "Official MCP schema had an unexpected shape")
+    _REGISTRY_SCHEMA_CACHE[schema_url] = schema
+    return schema
+
+
+async def mcp_registry_doctor(
+    server_json: dict[str, Any],
+    *,
+    probe_remote: bool = True,
+) -> dict[str, Any]:
+    """Validate server.json against the official schema and optionally probe remotes."""
+    if not isinstance(server_json, dict):
+        raise ToolError(400, "server_json must be a JSON object")
+
+    schema_url = str(
+        server_json.get("$schema") or _CURRENT_MCP_REGISTRY_SCHEMA
+    ).strip()
+    schema = await _load_registry_schema(schema_url)
+
+    try:
+        from jsonschema import validators
+
+        validator_cls = validators.validator_for(schema)
+        validator_cls.check_schema(schema)
+        validator = validator_cls(schema)
+        raw_errors = sorted(
+            validator.iter_errors(server_json),
+            key=lambda err: list(err.absolute_path),
+        )
+    except Exception as exc:
+        raise ToolError(502, "Unable to execute official MCP JSON Schema validation") from exc
+
+    errors = []
+    for err in raw_errors[:100]:
+        path = ".".join(str(item) for item in err.absolute_path) or "$"
+        errors.append(
+            {
+                "path": path,
+                "message": err.message,
+                "validator": err.validator,
+            }
+        )
+
+    warnings: list[dict[str, str]] = []
+    if schema_url != _CURRENT_MCP_REGISTRY_SCHEMA:
+        warnings.append(
+            {
+                "code": "NON_CURRENT_SCHEMA",
+                "message": (
+                    f"Manifest declares {schema_url}; current registry schema is "
+                    f"{_CURRENT_MCP_REGISTRY_SCHEMA}."
+                ),
+            }
+        )
+
+    name = str(server_json.get("name") or "")
+    description = str(server_json.get("description") or "")
+    if len(description) > 100:
+        warnings.append(
+            {
+                "code": "DESCRIPTION_OVER_100",
+                "message": "Registry descriptions are limited to 100 characters.",
+            }
+        )
+    if name and not re.fullmatch(r"[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+", name):
+        warnings.append(
+            {
+                "code": "NAME_SHAPE",
+                "message": "Server name should be namespace/name in the registry pattern.",
+            }
+        )
+
+    packages = server_json.get("packages")
+    remotes = server_json.get("remotes")
+    if not packages and not remotes:
+        warnings.append(
+            {
+                "code": "NO_PACKAGE_OR_REMOTE",
+                "message": "Manifest declares neither a package nor a remote endpoint.",
+            }
+        )
+
+    remote_results: list[dict[str, Any]] = []
+    if probe_remote and isinstance(remotes, list):
+        remote_urls = []
+        for remote in remotes[:5]:
+            if isinstance(remote, dict) and isinstance(remote.get("url"), str):
+                remote_urls.append(remote["url"])
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def probe(url: str) -> dict[str, Any]:
+            async with semaphore:
+                try:
+                    return await audit_mcp_server(url, timeout_seconds=10.0)
+                except ToolError as exc:
+                    return {
+                        "url": url,
+                        "status": "ERROR",
+                        "error": exc.message,
+                    }
+                except Exception as exc:
+                    return {
+                        "url": url,
+                        "status": "ERROR",
+                        "error": type(exc).__name__,
+                    }
+
+        if remote_urls:
+            remote_results = await asyncio.gather(*(probe(url) for url in remote_urls))
+
+    registry_lookup: dict[str, Any] | None = None
+    if name:
+        try:
+            lookup_url = (
+                "https://registry.modelcontextprotocol.io/v0.1/servers?search="
+                + quote(name, safe="")
+                + "&limit=10"
+            )
+            async with httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=10.0,
+            ) as client:
+                response, body, _ = await _bounded_request(
+                    client,
+                    "GET",
+                    lookup_url,
+                    headers={
+                        "User-Agent": "CIPHER-MCP-Registry-Doctor/1.0",
+                        "Accept": "application/json",
+                    },
+                    timeout_seconds=10.0,
+                )
+            if response.status_code == 200:
+                data = json.loads(body.decode("utf-8", errors="replace"))
+                rows = data.get("servers") if isinstance(data, dict) else None
+                if isinstance(rows, list):
+                    exact = [
+                        row
+                        for row in rows
+                        if isinstance(row, dict)
+                        and (
+                            row.get("name") == name
+                            or (row.get("server") or {}).get("name") == name
+                        )
+                    ]
+                    registry_lookup = {
+                        "exact_name_matches": len(exact),
+                        "already_present": bool(exact),
+                    }
+        except Exception:
+            registry_lookup = {"lookup_available": False}
+
+    remote_failures = [
+        item
+        for item in remote_results
+        if item.get("status") not in {"HEALTHY", "REVIEW", "AUTH_REQUIRED"}
+    ]
+    publish_readiness = (
+        "BLOCKED"
+        if errors
+        else "REVIEW"
+        if warnings or remote_failures
+        else "READY"
+    )
+
+    return {
+        "valid_against_declared_schema": not errors,
+        "schema_url": schema_url,
+        "current_schema_url": _CURRENT_MCP_REGISTRY_SCHEMA,
+        "errors": errors,
+        "warnings": warnings,
+        "remote_probes": remote_results,
+        "registry_lookup": registry_lookup,
+        "publish_readiness": publish_readiness,
+        "note": (
+            "Schema validation uses the official MCP Registry schema. "
+            "Authentication/namespace ownership failures can still occur at publish time."
         ),
     }

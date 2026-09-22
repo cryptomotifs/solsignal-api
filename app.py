@@ -90,6 +90,10 @@ PRICES = {
     "tool_mcp_audit": 10000,  # $0.01
     "tool_x402_audit": 10000, # $0.01
     "tool_payment_policy": 1000, # $0.001
+    "tool_mcp_bulk": 50000,     # $0.05
+    "tool_x402_bulk": 50000,    # $0.05
+    "tool_agent_preflight": 25000, # $0.025
+    "tool_registry_doctor": 10000, # $0.01
 }
 
 
@@ -103,6 +107,10 @@ def _paid_endpoint_catalog() -> list[dict[str, Any]]:
         ("/tools/mcp/audit", "POST", "Live MCP initialize/tools-list audit with tool fingerprinting and heuristic poisoning/change signals", "tool_mcp_audit"),
         ("/tools/x402/audit", "POST", "Cold-probe an x402 endpoint for valid 402 challenges and discovery/OpenAPI consistency without paying", "tool_x402_audit"),
         ("/tools/payment/policy", "POST", "Deterministic pre-payment firewall for budget, chain, asset, recipient, origin, and timeout policy", "tool_payment_policy"),
+        ("/tools/mcp/bulk", "POST", "Bulk live health/tool-fingerprint audit for up to 10 MCP endpoints", "tool_mcp_bulk"),
+        ("/tools/x402/bulk", "POST", "Bulk cold-probe and discovery audit for up to 10 x402 endpoints without paying", "tool_x402_bulk"),
+        ("/tools/agent/adoption-preflight", "POST", "Combined GitHub, MCP, and x402 evidence bundle for agent integration decisions", "tool_agent_preflight"),
+        ("/tools/mcp/registry-doctor", "POST", "Validate server.json against the official MCP Registry schema and optionally live-probe remotes", "tool_registry_doctor"),
         ("/tools/url/read", "POST", "Convert a public HTML or text URL into compact agent-readable Markdown plus links", "tool_url"),
         ("/tools/pdf/markdown", "POST", "Extract a public PDF text layer into page-structured Markdown", "tool_pdf"),
         ("/tools/json/repair", "POST", "Repair common malformed LLM JSON without another model call", "tool_json"),
@@ -1239,6 +1247,102 @@ async def tool_payment_policy(request: Request):
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
+@app.post("/tools/mcp/bulk")
+async def tool_mcp_bulk(request: Request):
+    block = await _gate(request, request.url.path, "tool_mcp_bulk")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("urls"), list):
+        return JSONResponse(status_code=400, content={"error": "urls must be a list"})
+    try:
+        from agent_infra_tools import bulk_mcp_audit
+        from agent_tools import ToolError
+        return await bulk_mcp_audit(
+            payload["urls"],
+            timeout_seconds=float(payload.get("timeout_seconds", 12.0)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "invalid timeout_seconds"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/x402/bulk")
+async def tool_x402_bulk(request: Request):
+    block = await _gate(request, request.url.path, "tool_x402_bulk")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("urls"), list):
+        return JSONResponse(status_code=400, content={"error": "urls must be a list"})
+    try:
+        from agent_infra_tools import bulk_x402_audit
+        from agent_tools import ToolError
+        return await bulk_x402_audit(
+            payload["urls"],
+            timeout_seconds=float(payload.get("timeout_seconds", 12.0)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "invalid timeout_seconds"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/agent/adoption-preflight")
+async def tool_agent_adoption_preflight(request: Request):
+    block = await _gate(request, request.url.path, "tool_agent_preflight")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
+    try:
+        from agent_infra_tools import agent_adoption_preflight
+        from agent_tools import ToolError
+        return await agent_adoption_preflight(
+            repo=payload.get("repo"),
+            mcp_url=payload.get("mcp_url"),
+            x402_url=payload.get("x402_url"),
+            timeout_seconds=float(payload.get("timeout_seconds", 12.0)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "invalid timeout_seconds"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/mcp/registry-doctor")
+async def tool_mcp_registry_doctor(request: Request):
+    block = await _gate(request, request.url.path, "tool_registry_doctor")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("server_json"), dict):
+        return JSONResponse(status_code=400, content={"error": "server_json must be a JSON object"})
+    try:
+        from agent_infra_tools import mcp_registry_doctor
+        from agent_tools import ToolError
+        return await mcp_registry_doctor(
+            payload["server_json"],
+            probe_remote=bool(payload.get("probe_remote", True)),
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
 @app.post("/tools/json/repair")
 async def tool_json_repair(request: Request):
     block = await _gate(request, request.url.path, "tool_json")
@@ -1805,6 +1909,44 @@ def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
                 },
             },
             "required": ["challenge", "policy"],
+            "additionalProperties": False,
+        },
+        "/tools/mcp/bulk": {
+            "type": "object",
+            "properties": {
+                "urls": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string", "format": "uri"}},
+                "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
+            },
+            "required": ["urls"],
+            "additionalProperties": False,
+        },
+        "/tools/x402/bulk": {
+            "type": "object",
+            "properties": {
+                "urls": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string", "format": "uri"}},
+                "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
+            },
+            "required": ["urls"],
+            "additionalProperties": False,
+        },
+        "/tools/agent/adoption-preflight": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "example": "openai/openai-agents-python"},
+                "mcp_url": {"type": "string", "format": "uri"},
+                "x402_url": {"type": "string", "format": "uri"},
+                "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
+            },
+            "minProperties": 1,
+            "additionalProperties": False,
+        },
+        "/tools/mcp/registry-doctor": {
+            "type": "object",
+            "properties": {
+                "server_json": {"type": "object", "description": "MCP Registry server.json document."},
+                "probe_remote": {"type": "boolean", "default": True},
+            },
+            "required": ["server_json"],
             "additionalProperties": False,
         },
         "/tools/transform": {
