@@ -311,8 +311,15 @@ def _deduct_credit(key: str):
 
 # --- x402 v2 + settlement-backed revenue ---
 
+def _sync_payment_store_config() -> None:
+    """Keep local/test SQLite overrides compatible with the legacy PAYMENTS_DB setting."""
+    if not DATABASE_URL:
+        _payment_store.sqlite_path = PAYMENTS_DB
+
+
 def _init_payments_db() -> None:
     """Initialize the settlement ledger (Postgres in production, SQLite locally)."""
+    _sync_payment_store_config()
     _payment_store.initialize()
 
 
@@ -325,6 +332,7 @@ def _record_settlement(
     network: str,
 ) -> None:
     """Persist a confirmed on-chain settlement exactly once."""
+    _sync_payment_store_config()
     _payment_store.record_settlement(
         transaction=transaction,
         endpoint=endpoint,
@@ -337,6 +345,7 @@ def _record_settlement(
 
 def _payment_stats() -> dict[str, Any]:
     """Return revenue derived only from confirmed settlement receipts."""
+    _sync_payment_store_config()
     return _payment_store.stats()
 
 
