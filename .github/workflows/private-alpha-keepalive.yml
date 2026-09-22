@@ -1,0 +1,24 @@
+name: Keep Private Alpha Awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping CIPHER Private Alpha health
+        run: |
+          for attempt in 1 2 3; do
+            if curl --fail --silent --show-error --max-time 45               https://cipher-private-alpha.onrender.com/health; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
