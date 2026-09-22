@@ -64,6 +64,13 @@ AGENT402_REGISTER_URL = os.environ.get(
 AGENT402_AUTO_REGISTER = os.environ.get("AGENT402_AUTO_REGISTER", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
+X402SCAN_REGISTER_URL = os.environ.get(
+    "X402SCAN_REGISTER_URL",
+    "https://x402scan.com/api/trpc/public.resources.registerFromOrigin",
+).strip()
+X402SCAN_AUTO_REGISTER = os.environ.get("X402SCAN_AUTO_REGISTER", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
@@ -329,6 +336,10 @@ async def lifespan(app: FastAPI):
     _background_tasks.add(registration_task)
     registration_task.add_done_callback(_background_tasks.discard)
 
+    x402scan_task = asyncio.create_task(_register_x402scan_origin())
+    _background_tasks.add(x402scan_task)
+    x402scan_task.add_done_callback(_background_tasks.discard)
+
     task = asyncio.create_task(_outcome_backfill_loop())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -372,6 +383,63 @@ async def _register_agent402_origin() -> None:
             "ok": False,
             "error_type": type(exc).__name__,
         }))
+
+
+async def _register_x402scan_origin() -> None:
+    """One-shot, explicitly enabled registration with x402scan's public registry."""
+    if not X402SCAN_AUTO_REGISTER:
+        return
+    if not PUBLIC_BASE_URL.startswith("https://"):
+        return
+
+    payload = {"json": {"origin": PUBLIC_BASE_URL}}
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            response = await client.post(
+                X402SCAN_REGISTER_URL,
+                json=payload,
+                headers={
+                    "User-Agent": "CIPHER-Agent-Tools/1.0",
+                    "Content-Type": "application/json",
+                },
+            )
+
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text[:3000]}
+
+        result = body
+        if isinstance(body, dict):
+            result = (
+                body.get("result", {})
+                .get("data", {})
+                .get("json", body)
+            )
+
+        success = (
+            200 <= response.status_code < 300
+            and isinstance(result, dict)
+            and result.get("success") is True
+        )
+        print(json.dumps({
+            "event": "x402scan_registration",
+            "status_code": response.status_code,
+            "origin": PUBLIC_BASE_URL,
+            "ok": success,
+            "result": result,
+        }, default=str))
+    except Exception as exc:
+        print(json.dumps({
+            "event": "x402scan_registration",
+            "origin": PUBLIC_BASE_URL,
+            "ok": False,
+            "error_type": type(exc).__name__,
+        }))
+
+
 
 
 async def _outcome_backfill_loop():
