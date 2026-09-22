@@ -26,6 +26,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
 from x402.extensions.bazaar import declare_discovery_extension
@@ -1543,3 +1544,189 @@ async def agent_manifest():
         },
         "version": "2.0.0",
     }
+
+
+# =========================================================================
+# OPENAPI PAYMENT DISCOVERY
+# =========================================================================
+
+def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
+    """JSON request schemas for raw-Request handlers that FastAPI cannot infer."""
+    schemas: dict[str, dict[str, Any]] = {
+        "/tools/url/read": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Public HTTP(S) URL to read.",
+                    "example": "https://example.com",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 100000,
+                    "default": 50000,
+                },
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        "/tools/pdf/markdown": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Public PDF URL.",
+                    "example": "https://example.com/document.pdf",
+                },
+                "max_pages": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 40,
+                    "default": 20,
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 150000,
+                    "default": 80000,
+                },
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        "/tools/json/repair": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Malformed JSON or common LLM JSON-like output.",
+                    "example": "{'status':'ok',}",
+                }
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        "/tools/transform": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "sha256", "sha512", "sha1", "md5", "blake2b",
+                        "base64_encode", "base64_decode", "base64url_decode",
+                        "hex_encode", "hex_decode", "url_encode", "url_decode",
+                        "jwt_decode",
+                    ],
+                    "example": "sha256",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Text to transform.",
+                    "example": "hello",
+                },
+            },
+            "required": ["operation", "value"],
+            "additionalProperties": False,
+        },
+    }
+    return schemas.get(path)
+
+
+def _cipher_openapi() -> dict[str, Any]:
+    """OpenAPI contract enriched for autonomous paid-tool discovery."""
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    info = schema.setdefault("info", {})
+    info["x-guidance"] = (
+        "CIPHER Agent Tools provides deterministic, machine-payable utilities over x402 v2 "
+        "USDC on Solana. Prefer the lowest-cost tool that directly matches the task. "
+        "Paid routes return HTTP 402 before performing paid work; an x402 client pays and retries. "
+        "Use /tools/catalog or /.well-known/x402 for the complete machine-readable catalog."
+    )
+
+    # /scan and /trending have free quotas, so do not claim they are always paid
+    # in an OpenAPI registry whose probes expect an immediate 402.
+    openapi_paid = [
+        item
+        for item in _paid_endpoint_catalog()
+        if item["path"] not in {"/scan/{mint}", "/trending"}
+    ]
+
+    paths = schema.setdefault("paths", {})
+    for item in openapi_paid:
+        path_item = paths.get(item["path"])
+        if not isinstance(path_item, dict):
+            continue
+        operation = path_item.get(item["method"].lower())
+        if not isinstance(operation, dict):
+            continue
+
+        operation["x-payment-info"] = {
+            "price": {
+                "mode": "fixed",
+                "currency": "USD",
+                "amount": f"{item['price_usdc']:.6f}",
+            },
+            "protocols": [{"x402": {}}],
+        }
+        responses = operation.setdefault("responses", {})
+        responses["402"] = {
+            "description": "Payment Required",
+            "headers": {
+                "PAYMENT-REQUIRED": {
+                    "description": "Base64-encoded x402 v2 payment requirements.",
+                    "schema": {"type": "string"},
+                }
+            },
+        }
+
+        body_schema = _openapi_request_body_schema(item["path"])
+        if body_schema is not None and item["method"] in {"POST", "PUT", "PATCH"}:
+            operation["requestBody"] = {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": body_schema,
+                    }
+                },
+            }
+
+        if item["path"] == "/tools/repo/preflight":
+            parameters = operation.setdefault("parameters", [])
+            found_repo = False
+            for parameter in parameters:
+                if (
+                    isinstance(parameter, dict)
+                    and parameter.get("in") == "query"
+                    and parameter.get("name") == "repo"
+                ):
+                    parameter["required"] = True
+                    parameter.setdefault("schema", {})["example"] = "openai/openai-agents-python"
+                    found_repo = True
+            if not found_repo:
+                parameters.append({
+                    "name": "repo",
+                    "in": "query",
+                    "required": True,
+                    "description": "owner/repository or a public GitHub repository URL",
+                    "schema": {
+                        "type": "string",
+                        "example": "openai/openai-agents-python",
+                    },
+                })
+
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _cipher_openapi
