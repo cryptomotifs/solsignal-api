@@ -57,6 +57,12 @@ PUBLIC_BASE_URL = (
     or os.environ.get("RENDER_EXTERNAL_URL")
     or "https://solsignal-api.onrender.com"
 ).rstrip("/")
+AGENT402_REGISTER_URL = os.environ.get(
+    "AGENT402_REGISTER_URL", "https://agent402.tools/api/index/register"
+).strip()
+AGENT402_AUTO_REGISTER = os.environ.get("AGENT402_AUTO_REGISTER", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
@@ -318,6 +324,10 @@ async def lifespan(app: FastAPI):
 
     _init_payments_db()
 
+    registration_task = asyncio.create_task(_register_agent402_origin())
+    _background_tasks.add(registration_task)
+    registration_task.add_done_callback(_background_tasks.discard)
+
     task = asyncio.create_task(_outcome_backfill_loop())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -328,6 +338,39 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await _x402_facilitator_client.aclose()
+
+
+async def _register_agent402_origin() -> None:
+    """Best-effort registration with Agent402's public seller index.
+
+    This sends only the public service origin. Failures never block API startup.
+    """
+    if not AGENT402_AUTO_REGISTER:
+        return
+    if not PUBLIC_BASE_URL.startswith("https://"):
+        return
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.post(
+                AGENT402_REGISTER_URL,
+                json={"origin": PUBLIC_BASE_URL},
+                headers={"User-Agent": "CIPHER-Agent-Tools/1.0"},
+            )
+        print(json.dumps({
+            "event": "agent402_registration",
+            "status_code": response.status_code,
+            "origin": PUBLIC_BASE_URL,
+            "ok": 200 <= response.status_code < 300,
+        }))
+    except Exception as exc:
+        print(json.dumps({
+            "event": "agent402_registration",
+            "origin": PUBLIC_BASE_URL,
+            "ok": False,
+            "error_type": type(exc).__name__,
+        }))
 
 
 async def _outcome_backfill_loop():
