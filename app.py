@@ -96,6 +96,10 @@ PRICES = {
     "tool_registry_doctor": 10000, # $0.01
     "tool_mcp_oauth_doctor": 10000, # $0.01
     "tool_x402_prepay": 5000,       # $0.005
+    "tool_solana_chain": 1000,       # $0.001
+    "tool_solana_wallet": 3000,      # $0.003
+    "tool_solana_token": 2000,       # $0.002
+    "tool_solana_tx_verify": 5000,   # $0.005
 }
 
 
@@ -115,6 +119,10 @@ def _paid_endpoint_catalog() -> list[dict[str, Any]]:
         ("/tools/mcp/registry-doctor", "POST", "Validate server.json against the official MCP Registry schema and optionally live-probe remotes", "tool_registry_doctor"),
         ("/tools/mcp/oauth-doctor", "POST", "Audit MCP OAuth/RFC 9728 protected-resource and authorization-server discovery without credentials", "tool_mcp_oauth_doctor"),
         ("/tools/x402/prepay-verify", "POST", "Re-fetch x402 payment terms and enforce budget/network/asset/recipient/origin policy before payment", "tool_x402_prepay"),
+        ("/tools/solana/chain", "GET", "Current Solana mainnet slot, block height, and epoch status", "tool_solana_chain"),
+        ("/tools/solana/wallet", "POST", "Read-only SOL/USDC wallet summary with recent transaction signatures", "tool_solana_wallet"),
+        ("/tools/solana/token-balance", "POST", "Read-only SPL token balance across all token accounts for an owner and mint", "tool_solana_token"),
+        ("/tools/solana/tx-verify", "POST", "Verify a confirmed Solana transaction and USDC recipient balance delta", "tool_solana_tx_verify"),
         ("/tools/url/read", "POST", "Convert a public HTML or text URL into compact agent-readable Markdown plus links", "tool_url"),
         ("/tools/pdf/markdown", "POST", "Extract a public PDF text layer into page-structured Markdown", "tool_pdf"),
         ("/tools/json/repair", "POST", "Repair common malformed LLM JSON without another model call", "tool_json"),
@@ -256,6 +264,44 @@ def _bazaar_extensions(resource: str, price_key: str) -> dict[str, Any]:
                     "timeout_seconds": {"type": "number"},
                 },
                 "required": ["url", "policy"],
+            }
+        elif template == "/tools/solana/wallet":
+            input_example = {
+                "address": "11111111111111111111111111111111",
+                "recent_limit": 5,
+            }
+            input_schema = {
+                "properties": {
+                    "address": {"type": "string"},
+                    "recent_limit": {"type": "integer"},
+                },
+                "required": ["address"],
+            }
+        elif template == "/tools/solana/token-balance":
+            input_example = {
+                "owner": "11111111111111111111111111111111",
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            }
+            input_schema = {
+                "properties": {
+                    "owner": {"type": "string"},
+                    "mint": {"type": "string"},
+                },
+                "required": ["owner", "mint"],
+            }
+        elif template == "/tools/solana/tx-verify":
+            input_example = {
+                "signature": "5" + "1" * 87,
+                "to": "HDJ88KsVwUGxGZmEdKtgMxHvssZR4gfFp1v1izCPK5x9",
+                "min_usdc": 0.005,
+            }
+            input_schema = {
+                "properties": {
+                    "signature": {"type": "string"},
+                    "to": {"type": "string"},
+                    "min_usdc": {"type": "number"},
+                },
+                "required": ["signature"],
             }
         elif template == "/tools/transform":
             input_example = {"operation": "sha256", "value": "hello"}
@@ -916,6 +962,10 @@ async def root():
             "/tools/pdf/markdown": "$0.005 — PDF text layer to markdown",
             "/tools/json/repair": "$0.001 — repair malformed LLM JSON",
             "/tools/transform": "$0.001 — hash/encode/decode/JWT plumbing",
+            "/tools/solana/chain": "$0.001 — Solana slot/block/epoch status",
+            "/tools/solana/wallet": "$0.003 — read-only SOL/USDC wallet summary",
+            "/tools/solana/token-balance": "$0.002 — SPL owner/mint balance",
+            "/tools/solana/tx-verify": "$0.005 — verify confirmed USDC settlement deltas",
             "## System": "---",
             "/health": "Free — System status",
             "/agents": "Free — All agents with precision stats",
@@ -1415,6 +1465,92 @@ async def tool_x402_prepay_verify(request: Request):
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
+@app.get("/tools/solana/chain")
+async def tool_solana_chain(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_chain")
+    if block:
+        return block
+    try:
+        from solana_tools import solana_chain_status
+        from agent_tools import ToolError
+        return await solana_chain_status()
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/wallet")
+async def tool_solana_wallet(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_wallet")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("address"), str):
+        return JSONResponse(status_code=400, content={"error": "address is required"})
+    try:
+        from solana_tools import solana_wallet_summary
+        from agent_tools import ToolError
+        return await solana_wallet_summary(
+            payload["address"],
+            recent_limit=int(payload.get("recent_limit", 5)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "recent_limit must be an integer"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/token-balance")
+async def tool_solana_token_balance(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_token")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("owner"), str)
+        or not isinstance(payload.get("mint"), str)
+    ):
+        return JSONResponse(status_code=400, content={"error": "owner and mint are required"})
+    try:
+        from solana_tools import solana_token_balance
+        from agent_tools import ToolError
+        return await solana_token_balance(payload["owner"], payload["mint"])
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/tx-verify")
+async def tool_solana_tx_verify(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_tx_verify")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("signature"), str):
+        return JSONResponse(status_code=400, content={"error": "signature is required"})
+    to = payload.get("to")
+    if to is not None and not isinstance(to, str):
+        return JSONResponse(status_code=400, content={"error": "to must be a Solana address string"})
+    try:
+        from solana_tools import solana_verify_usdc_settlement
+        from agent_tools import ToolError
+        return await solana_verify_usdc_settlement(
+            payload["signature"],
+            to=to,
+            min_usdc=payload.get("min_usdc"),
+        )
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
 @app.post("/tools/mcp/registry-doctor")
 async def tool_mcp_registry_doctor(request: Request):
     block = await _gate(request, request.url.path, "tool_registry_doctor")
@@ -1497,6 +1633,10 @@ Use these endpoints when your agent needs normalized data or deterministic utili
 | `/tools/url/read` | POST | $0.003 | Convert a public HTML/text URL into compact agent-readable Markdown. |
 | `/tools/pdf/markdown` | POST | $0.005 | Extract a public PDF text layer into page-structured Markdown. |
 | `/tools/json/repair` | POST | $0.001 | Repair common malformed LLM JSON without another model call. |
+| `/tools/solana/chain` | GET | $0.001 | Read current Solana slot, block height, and epoch. |
+| `/tools/solana/wallet` | POST | $0.003 | Read SOL/USDC balances and recent signatures for a wallet. |
+| `/tools/solana/token-balance` | POST | $0.002 | Read an SPL token balance for an owner/mint pair. |
+| `/tools/solana/tx-verify` | POST | $0.005 | Verify confirmed USDC recipient balance deltas for a Solana transaction. |
 | `/scan/{{mint}}` | GET | $0.01 after free quota | Screen a Solana token across multiple safety sources. |
 
 ## Payment flow
@@ -2076,6 +2216,34 @@ def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
                 "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
             },
             "required": ["url", "policy"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/wallet": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "Solana wallet public key."},
+                "recent_limit": {"type": "integer", "minimum": 0, "maximum": 20, "default": 5},
+            },
+            "required": ["address"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/token-balance": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Solana wallet public key."},
+                "mint": {"type": "string", "description": "SPL token mint public key."},
+            },
+            "required": ["owner", "mint"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/tx-verify": {
+            "type": "object",
+            "properties": {
+                "signature": {"type": "string", "description": "Confirmed Solana transaction signature."},
+                "to": {"type": "string", "description": "Optional expected USDC recipient owner."},
+                "min_usdc": {"type": "number", "minimum": 0, "description": "Optional minimum USDC credit expected for the recipient."},
+            },
+            "required": ["signature"],
             "additionalProperties": False,
         },
         "/tools/transform": {
