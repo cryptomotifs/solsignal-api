@@ -100,6 +100,11 @@ PRICES = {
     "tool_solana_wallet": 3000,      # $0.003
     "tool_solana_token": 2000,       # $0.002
     "tool_solana_tx_verify": 5000,   # $0.005
+    "tool_solana_blockhash": 1000,    # $0.001
+    "tool_solana_priority": 2000,     # $0.002
+    "tool_solana_rent": 1000,         # $0.001
+    "tool_solana_account": 1000,      # $0.001
+    "tool_solana_message_fee": 2000,  # $0.002
 }
 
 
@@ -123,6 +128,11 @@ def _paid_endpoint_catalog() -> list[dict[str, Any]]:
         ("/tools/solana/wallet", "POST", "Read-only SOL/USDC wallet summary with recent transaction signatures", "tool_solana_wallet"),
         ("/tools/solana/token-balance", "POST", "Read-only SPL token balance across all token accounts for an owner and mint", "tool_solana_token"),
         ("/tools/solana/tx-verify", "POST", "Verify a confirmed Solana transaction and USDC recipient balance delta", "tool_solana_tx_verify"),
+        ("/tools/solana/blockhash", "GET", "Fresh confirmed Solana blockhash and last-valid block height for transaction construction", "tool_solana_blockhash"),
+        ("/tools/solana/priority-fees", "POST", "Recent Solana priority-fee samples and non-zero percentiles, optionally scoped to writable accounts", "tool_solana_priority"),
+        ("/tools/solana/rent", "POST", "Minimum rent-exempt balance for a Solana account data size", "tool_solana_rent"),
+        ("/tools/solana/account", "POST", "Compact read-only metadata for a Solana account", "tool_solana_account"),
+        ("/tools/solana/message-fee", "POST", "Calculate network fee for a base64 serialized Solana message without signing or submitting it", "tool_solana_message_fee"),
         ("/tools/url/read", "POST", "Convert a public HTML or text URL into compact agent-readable Markdown plus links", "tool_url"),
         ("/tools/pdf/markdown", "POST", "Extract a public PDF text layer into page-structured Markdown", "tool_pdf"),
         ("/tools/json/repair", "POST", "Repair common malformed LLM JSON without another model call", "tool_json"),
@@ -302,6 +312,41 @@ def _bazaar_extensions(resource: str, price_key: str) -> dict[str, Any]:
                     "min_usdc": {"type": "number"},
                 },
                 "required": ["signature"],
+            }
+        elif template == "/tools/solana/priority-fees":
+            input_example = {
+                "accounts": [],
+                "sample_limit": 50,
+            }
+            input_schema = {
+                "properties": {
+                    "accounts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 128,
+                    },
+                    "sample_limit": {"type": "integer"},
+                }
+            }
+        elif template == "/tools/solana/rent":
+            input_example = {"data_len": 165}
+            input_schema = {
+                "properties": {"data_len": {"type": "integer"}},
+                "required": ["data_len"],
+            }
+        elif template == "/tools/solana/account":
+            input_example = {
+                "address": "11111111111111111111111111111111",
+            }
+            input_schema = {
+                "properties": {"address": {"type": "string"}},
+                "required": ["address"],
+            }
+        elif template == "/tools/solana/message-fee":
+            input_example = {"message_base64": "AQ=="}
+            input_schema = {
+                "properties": {"message_base64": {"type": "string"}},
+                "required": ["message_base64"],
             }
         elif template == "/tools/transform":
             input_example = {"operation": "sha256", "value": "hello"}
@@ -966,6 +1011,11 @@ async def root():
             "/tools/solana/wallet": "$0.003 — read-only SOL/USDC wallet summary",
             "/tools/solana/token-balance": "$0.002 — SPL owner/mint balance",
             "/tools/solana/tx-verify": "$0.005 — verify confirmed USDC settlement deltas",
+            "/tools/solana/blockhash": "$0.001 — fresh blockhash for transaction construction",
+            "/tools/solana/priority-fees": "$0.002 — recent priority-fee percentiles",
+            "/tools/solana/rent": "$0.001 — rent-exempt balance by account size",
+            "/tools/solana/account": "$0.001 — compact account metadata",
+            "/tools/solana/message-fee": "$0.002 — fee for a serialized transaction message",
             "## System": "---",
             "/health": "Free — System status",
             "/agents": "Free — All agents with precision stats",
@@ -1551,6 +1601,103 @@ async def tool_solana_tx_verify(request: Request):
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
+@app.get("/tools/solana/blockhash")
+async def tool_solana_blockhash(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_blockhash")
+    if block:
+        return block
+    try:
+        from solana_tools import solana_latest_blockhash
+        from agent_tools import ToolError
+        return await solana_latest_blockhash()
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/priority-fees")
+async def tool_solana_priority_fees(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_priority")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
+    accounts = payload.get("accounts", [])
+    if not isinstance(accounts, list):
+        return JSONResponse(status_code=400, content={"error": "accounts must be an array"})
+    try:
+        from solana_tools import solana_priority_fees
+        from agent_tools import ToolError
+        return await solana_priority_fees(
+            accounts=accounts,
+            sample_limit=int(payload.get("sample_limit", 50)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "sample_limit must be an integer"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/rent")
+async def tool_solana_rent(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_rent")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or "data_len" not in payload:
+        return JSONResponse(status_code=400, content={"error": "data_len is required"})
+    try:
+        from solana_tools import solana_rent_exemption
+        from agent_tools import ToolError
+        return await solana_rent_exemption(payload["data_len"])
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/account")
+async def tool_solana_account(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_account")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("address"), str):
+        return JSONResponse(status_code=400, content={"error": "address is required"})
+    try:
+        from solana_tools import solana_account_info
+        from agent_tools import ToolError
+        return await solana_account_info(payload["address"])
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/solana/message-fee")
+async def tool_solana_message_fee(request: Request):
+    block = await _gate(request, request.url.path, "tool_solana_message_fee")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("message_base64"), str):
+        return JSONResponse(status_code=400, content={"error": "message_base64 is required"})
+    try:
+        from solana_tools import solana_message_fee
+        from agent_tools import ToolError
+        return await solana_message_fee(payload["message_base64"])
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
 @app.post("/tools/mcp/registry-doctor")
 async def tool_mcp_registry_doctor(request: Request):
     block = await _gate(request, request.url.path, "tool_registry_doctor")
@@ -1637,6 +1784,11 @@ Use these endpoints when your agent needs normalized data or deterministic utili
 | `/tools/solana/wallet` | POST | $0.003 | Read SOL/USDC balances and recent signatures for a wallet. |
 | `/tools/solana/token-balance` | POST | $0.002 | Read an SPL token balance for an owner/mint pair. |
 | `/tools/solana/tx-verify` | POST | $0.005 | Verify confirmed USDC recipient balance deltas for a Solana transaction. |
+| `/tools/solana/blockhash` | GET | $0.001 | Get a fresh confirmed blockhash and last-valid block height. |
+| `/tools/solana/priority-fees` | POST | $0.002 | Read recent priority-fee samples and p50/p75/p90 non-zero prices. |
+| `/tools/solana/rent` | POST | $0.001 | Calculate rent-exempt lamports for an account data length. |
+| `/tools/solana/account` | POST | $0.001 | Read compact public account metadata. |
+| `/tools/solana/message-fee` | POST | $0.002 | Calculate fee for a base64 serialized message without submitting it. |
 | `/scan/{{mint}}` | GET | $0.01 after free quota | Screen a Solana token across multiple safety sources. |
 
 ## Payment flow
@@ -2244,6 +2396,43 @@ def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
                 "min_usdc": {"type": "number", "minimum": 0, "description": "Optional minimum USDC credit expected for the recipient."},
             },
             "required": ["signature"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/priority-fees": {
+            "type": "object",
+            "properties": {
+                "accounts": {
+                    "type": "array",
+                    "maxItems": 128,
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+                "sample_limit": {"type": "integer", "minimum": 1, "maximum": 150, "default": 50},
+            },
+            "additionalProperties": False,
+        },
+        "/tools/solana/rent": {
+            "type": "object",
+            "properties": {
+                "data_len": {"type": "integer", "minimum": 0, "maximum": 10485760},
+            },
+            "required": ["data_len"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/account": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "Solana account public key."},
+            },
+            "required": ["address"],
+            "additionalProperties": False,
+        },
+        "/tools/solana/message-fee": {
+            "type": "object",
+            "properties": {
+                "message_base64": {"type": "string", "description": "Base64-encoded serialized Solana message."},
+            },
+            "required": ["message_base64"],
             "additionalProperties": False,
         },
         "/tools/transform": {
