@@ -1,4 +1,37 @@
-# SolSignal API — Solana Token Safety Scanner
+# CIPHER Agent Tools
+
+Browser storefront: https://cipher-agent-tools.onrender.com
+
+Pay-per-call utilities for developers and agents: JSON repair, webpage-to-Markdown,
+PDF text extraction, repository preflight, and DeFi data. Prices and schemas are
+available at `/tools/catalog`, `/docs`, and `/skill.md`. Payments use x402 v2 and
+USDC on Solana. Card payments and self-service subscriptions are not implemented.
+
+The browser homepage includes a free local-only JSON formatting preview. It is
+not a replacement for the paid malformed-JSON repair endpoint. JSON clients keep
+the existing machine-readable root response; browsers receive the storefront.
+
+This early release uses free Render hosting, which can cold-start. Successful
+on-chain settlements, not visits or payment challenges, are the revenue measure.
+The SQLite revenue counter is local to the service and can reset on free-host
+redeploys; on-chain receipts remain the authoritative payment evidence. No income
+or uptime is promised. Public source availability and API rate limits affect tools.
+
+## Run and verify
+
+```sh
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+uvicorn app:app --port 8402
+```
+
+For customer acquisition, start with agent developers who already use x402;
+people expecting card checkout cannot buy directly from this release. Use the
+public issue tracker for integration feedback. Do not submit confidential inputs.
+
+---
+
+## Legacy SolSignal API — Solana Token Safety Scanner
 
 **4 sources. 1 verdict. Under 2 seconds.**
 
@@ -84,8 +117,6 @@ curl https://solsignal-api.onrender.com/track/stats
 | Tier | Price | Scans | Trending |
 |------|-------|-------|----------|
 | Free | $0 | 10/day (by IP) | 3/day |
-| Developer | $9/month | 1,000/month | Unlimited |
-| Pro | $29/month | 5,000/month | Unlimited |
 | x402 | $0.01/scan | Pay per call | $0.01/call |
 
 ## Authentication

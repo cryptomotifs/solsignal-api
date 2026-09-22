@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 data/api_keys.json
+.venv/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+data/payments.db*
+data/scan_history.db*

@@ -26,7 +26,8 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from x402.http import (
     FacilitatorConfig,
@@ -550,8 +551,24 @@ def _query_db(db_path: str, sql: str, params: tuple = ()) -> list[dict]:
 # PRIMARY ENDPOINTS — Token Safety Scanner
 # =========================================================================
 
-@app.get("/")
-async def root():
+STOREFRONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storefront")
+app.mount("/storefront", StaticFiles(directory=STOREFRONT_DIR), name="storefront")
+
+
+@app.get("/", response_model=None)
+async def root(request: Request, response: Response):
+    response.headers["Vary"] = "Accept"
+    if "text/html" in request.headers.get("accept", "").lower():
+        return FileResponse(
+            os.path.join(STOREFRONT_DIR, "index.html"),
+            media_type="text/html",
+            headers={
+                "Vary": "Accept",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            },
+        )
     configs = _load_boost_configs()
     return {
         "name": "CIPHER Agent Tools",
@@ -586,8 +603,6 @@ async def root():
         },
         "pricing": {
             "free": "10 scans/day + 3 trending/day (by IP)",
-            "developer": "$9/month — 1000 scans/month",
-            "pro": "$29/month — 5000 scans/month",
             "x402": "$0.001-$0.10 per call (USDC on Solana)",
         },
         "auth": ["Free tier (IP)", "API key (X-API-Key header)", "x402 (USDC on Solana)"],
