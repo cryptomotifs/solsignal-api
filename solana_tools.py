@@ -727,3 +727,335 @@ async def solana_message_fee(message_base64: str) -> dict[str, Any]:
     }
     _cache_set(cache_key, output)
     return output
+
+
+
+async def solana_transaction_status(
+    signature: str,
+    *,
+    search_history: bool = True,
+) -> dict[str, Any]:
+    """Current confirmation/result state for one Solana transaction signature."""
+    signature = _validate_signature(signature)
+    cache_key = f"solana:status:{signature}:{int(bool(search_history))}"
+    cached = _cache_get(cache_key, 2.0)
+    if cached is not None:
+        return {**cached, "cached": True}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        result = await _rpc(
+            client,
+            "getSignatureStatuses",
+            [
+                [signature],
+                {"searchTransactionHistory": bool(search_history)},
+            ],
+        )
+
+    context = (result or {}).get("context", {}) if isinstance(result, dict) else {}
+    values = (result or {}).get("value", []) if isinstance(result, dict) else []
+    status = values[0] if isinstance(values, list) and values else None
+
+    if status is None:
+        output = {
+            "signature": signature,
+            "found": False,
+            "success": None,
+            "confirmation_status": None,
+            "slot": None,
+            "confirmations": None,
+            "context_slot": context.get("slot"),
+            "search_transaction_history": bool(search_history),
+            "source": "solana_rpc:getSignatureStatuses",
+            "cached": False,
+        }
+        _cache_set(cache_key, output)
+        return output
+
+    if not isinstance(status, dict):
+        raise ToolError(502, "Solana RPC returned invalid signature-status data")
+
+    confirmation = status.get("confirmationStatus")
+    output = {
+        "signature": signature,
+        "found": True,
+        "success": status.get("err") is None,
+        "error": status.get("err"),
+        "confirmation_status": confirmation,
+        "processed": confirmation in {"processed", "confirmed", "finalized"},
+        "confirmed": confirmation in {"confirmed", "finalized"},
+        "finalized": confirmation == "finalized",
+        "slot": status.get("slot"),
+        "confirmations": status.get("confirmations"),
+        "context_slot": context.get("slot"),
+        "search_transaction_history": bool(search_history),
+        "source": "solana_rpc:getSignatureStatuses",
+        "cached": False,
+    }
+    _cache_set(cache_key, output)
+    return output
+
+
+async def solana_simulate_transaction(
+    transaction_base64: str,
+    *,
+    replace_recent_blockhash: bool = True,
+    inner_instructions: bool = False,
+) -> dict[str, Any]:
+    """Simulate a base64 Solana transaction without signing or broadcasting it."""
+    if not isinstance(transaction_base64, str) or not transaction_base64.strip():
+        raise ToolError(400, "transaction_base64 must be a non-empty string")
+    value = transaction_base64.strip()
+    if len(value) > 24_000:
+        raise ToolError(413, "Serialized transaction is too large")
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise ToolError(400, "transaction_base64 is not valid Base64") from exc
+    if not raw:
+        raise ToolError(400, "transaction_base64 decodes to an empty payload")
+    if len(raw) > 16_000:
+        raise ToolError(413, "Decoded transaction is too large")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        result = await _rpc(
+            client,
+            "simulateTransaction",
+            [
+                value,
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed",
+                    "sigVerify": False,
+                    "replaceRecentBlockhash": bool(replace_recent_blockhash),
+                    "innerInstructions": bool(inner_instructions),
+                },
+            ],
+        )
+
+    if not isinstance(result, dict):
+        raise ToolError(502, "Solana RPC returned invalid simulation data")
+    context = result.get("context") or {}
+    sim = result.get("value") or {}
+    if not isinstance(sim, dict):
+        raise ToolError(502, "Solana RPC returned invalid simulation result")
+
+    logs = sim.get("logs")
+    if not isinstance(logs, list):
+        logs = []
+    safe_logs = [str(line)[:2000] for line in logs[:250]]
+
+    return {
+        "network": "solana-mainnet",
+        "simulation_success": sim.get("err") is None,
+        "error": sim.get("err"),
+        "units_consumed": sim.get("unitsConsumed"),
+        "fee_lamports": sim.get("fee"),
+        "logs": safe_logs,
+        "logs_truncated": len(logs) > len(safe_logs),
+        "replacement_blockhash": sim.get("replacementBlockhash"),
+        "return_data": sim.get("returnData"),
+        "loaded_accounts_data_size": sim.get("loadedAccountsDataSize"),
+        "inner_instructions": sim.get("innerInstructions") if inner_instructions else None,
+        "pre_balances": sim.get("preBalances"),
+        "post_balances": sim.get("postBalances"),
+        "pre_token_balances": sim.get("preTokenBalances"),
+        "post_token_balances": sim.get("postTokenBalances"),
+        "context_slot": context.get("slot"),
+        "replace_recent_blockhash": bool(replace_recent_blockhash),
+        "sig_verify": False,
+        "broadcast": False,
+        "source": "solana_rpc:simulateTransaction",
+        "note": (
+            "Read-only simulation. CIPHER does not sign, broadcast, or submit the transaction. "
+            "When replace_recent_blockhash is enabled the RPC node substitutes a valid blockhash."
+        ),
+    }
+
+
+def _compact_instruction(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    parsed = item.get("parsed")
+    compact: dict[str, Any] = {
+        "program": item.get("program"),
+        "program_id": item.get("programId"),
+    }
+    if isinstance(parsed, dict):
+        compact["type"] = parsed.get("type")
+        info = parsed.get("info")
+        if isinstance(info, dict):
+            # Keep common public fields useful to agents without copying arbitrary huge payloads.
+            allowed = (
+                "source", "destination", "authority", "owner", "mint",
+                "account", "wallet", "lamports", "amount", "tokenAmount",
+                "newAccount", "space",
+            )
+            compact["info"] = {
+                key: info.get(key)
+                for key in allowed
+                if key in info
+            }
+    else:
+        compact["accounts"] = item.get("accounts")
+        compact["data"] = str(item.get("data") or "")[:1000]
+    return compact
+
+
+async def solana_transaction_forensics(signature: str) -> dict[str, Any]:
+    """Deterministic transaction forensics from confirmed Solana chain data."""
+    signature = _validate_signature(signature)
+    cache_key = f"solana:forensics:{signature}"
+    cached = _cache_get(cache_key, 30.0)
+    if cached is not None:
+        return {**cached, "cached": True}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        status_result, transaction = await asyncio.gather(
+            _rpc(
+                client,
+                "getSignatureStatuses",
+                [[signature], {"searchTransactionHistory": True}],
+            ),
+            _rpc(
+                client,
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            ),
+        )
+
+    if transaction is None:
+        status_values = (
+            status_result.get("value", [])
+            if isinstance(status_result, dict)
+            else []
+        )
+        status = status_values[0] if status_values else None
+        return {
+            "signature": signature,
+            "found_transaction": False,
+            "status": status,
+            "source": "solana_rpc",
+            "cached": False,
+        }
+    if not isinstance(transaction, dict):
+        raise ToolError(502, "Solana RPC returned invalid transaction data")
+
+    meta = transaction.get("meta") or {}
+    tx = transaction.get("transaction") or {}
+    message = tx.get("message") or {}
+    account_keys_raw = message.get("accountKeys") or []
+
+    account_keys: list[dict[str, Any]] = []
+    for item in account_keys_raw[:256]:
+        if isinstance(item, dict):
+            account_keys.append(
+                {
+                    "pubkey": item.get("pubkey"),
+                    "signer": bool(item.get("signer")),
+                    "writable": bool(item.get("writable")),
+                    "source": item.get("source"),
+                }
+            )
+        else:
+            account_keys.append(
+                {
+                    "pubkey": str(item),
+                    "signer": None,
+                    "writable": None,
+                    "source": None,
+                }
+            )
+
+    instructions = []
+    programs: set[str] = set()
+    for item in (message.get("instructions") or [])[:256]:
+        compact = _compact_instruction(item)
+        if compact:
+            instructions.append(compact)
+            program = compact.get("program") or compact.get("program_id")
+            if program:
+                programs.add(str(program))
+
+    pre_balances = meta.get("preBalances") or []
+    post_balances = meta.get("postBalances") or []
+    lamport_deltas = []
+    for index in range(min(len(pre_balances), len(post_balances), len(account_keys))):
+        try:
+            delta = int(post_balances[index]) - int(pre_balances[index])
+        except (TypeError, ValueError):
+            continue
+        if delta:
+            lamport_deltas.append(
+                {
+                    "account": account_keys[index].get("pubkey"),
+                    "lamport_delta": delta,
+                    "sol_delta": str(Decimal(delta) / Decimal(1_000_000_000)),
+                }
+            )
+
+    pre_usdc = _usdc_owner_balances(meta.get("preTokenBalances"))
+    post_usdc = _usdc_owner_balances(meta.get("postTokenBalances"))
+    usdc_deltas = []
+    for owner in sorted(set(pre_usdc) | set(post_usdc)):
+        delta = post_usdc.get(owner, 0) - pre_usdc.get(owner, 0)
+        if delta:
+            usdc_deltas.append(
+                {
+                    "owner": owner,
+                    "raw_delta": str(delta),
+                    "usdc_delta": str(Decimal(delta) / Decimal(1_000_000)),
+                }
+            )
+
+    logs = meta.get("logMessages")
+    if not isinstance(logs, list):
+        logs = []
+    safe_logs = [str(line)[:2000] for line in logs[:300]]
+
+    status_values = (
+        status_result.get("value", [])
+        if isinstance(status_result, dict)
+        else []
+    )
+    status = status_values[0] if status_values else None
+
+    output = {
+        "signature": signature,
+        "found_transaction": True,
+        "success": meta.get("err") is None,
+        "error": meta.get("err"),
+        "confirmation_status": (
+            status.get("confirmationStatus")
+            if isinstance(status, dict)
+            else None
+        ),
+        "slot": transaction.get("slot"),
+        "block_time": transaction.get("blockTime"),
+        "fee_lamports": meta.get("fee"),
+        "compute_units_consumed": meta.get("computeUnitsConsumed"),
+        "signatures": tx.get("signatures"),
+        "account_keys": account_keys,
+        "programs": sorted(programs),
+        "instructions": instructions,
+        "instruction_count": len(message.get("instructions") or []),
+        "lamport_deltas": lamport_deltas,
+        "usdc_owner_deltas": usdc_deltas,
+        "logs": safe_logs,
+        "logs_truncated": len(logs) > len(safe_logs),
+        "source": "solana_rpc",
+        "cached": False,
+        "scope_note": (
+            "Deterministic on-chain forensics only. Parsed instruction fields depend on RPC "
+            "decoding support and this report does not infer off-chain intent."
+        ),
+    }
+    _cache_set(cache_key, output)
+    return output
