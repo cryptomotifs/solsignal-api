@@ -16,5 +16,5 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: python -m py_compile app.py scanner.py scoring.py tracker.py agent_tools.py agent_infra_tools.py payment_store.py
+      - run: python -m py_compile app.py scanner.py scoring.py tracker.py agent_tools.py agent_infra_tools.py
       - run: PYTHONPATH=. pytest -q
