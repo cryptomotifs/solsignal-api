@@ -1,8 +1,11 @@
 fastapi>=0.115.0
 uvicorn>=0.27.0
 httpx>=0.28.1
-x402[svm,extensions]==2.23.0
+x402[svm,extensions,mcp]==2.23.0
 # x402 2.23.0 still imports solana.rpc.api.Client; solana-py 0.40 removed it.
 solana==0.39.0
 
 pypdf>=5.0.0,<7
+
+# x402 2.23.0 MCP wrapper uses the MCP 1.x FastMCP API.
+mcp>=1.28,<2

@@ -20,7 +20,7 @@ import os
 import secrets
 import sqlite3
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,6 +28,8 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+
+from cipher_mcp import LazyMCPBridge, build_cipher_mcp
 
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 from x402.http import (
@@ -537,16 +539,12 @@ def _record_free_usage(ip: str, endpoint: str):
 
 # --- Background task ---
 _background_tasks: set[asyncio.Task] = set()
+_mcp_bridge = LazyMCPBridge()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle.
-
-    Initialize production x402 capabilities before accepting paid requests.
-    If the facilitator is temporarily unavailable, the API stays up but paid
-    requests fail closed rather than being counted as revenue.
-    """
+    """Startup/shutdown lifecycle for HTTP + paid MCP on one x402 resource server."""
     global _x402_ready, _x402_init_error
 
     if SOLANA_WALLET:
@@ -560,24 +558,82 @@ async def lifespan(app: FastAPI):
 
     _init_payments_db()
 
-    registration_task = asyncio.create_task(_register_agent402_origin())
-    _background_tasks.add(registration_task)
-    registration_task.add_done_callback(_background_tasks.discard)
+    async def record_mcp_settlement(
+        *,
+        tool_name: str,
+        transaction: str,
+        amount_atomic: int,
+        payer: str | None,
+        network: str,
+    ) -> None:
+        if not transaction:
+            raise ValueError("MCP settlement must include an on-chain transaction")
+        endpoint = f"mcp:{tool_name}"
+        _record_settlement(
+            transaction=transaction,
+            endpoint=endpoint,
+            amount_atomic=amount_atomic,
+            payer=payer,
+            network=network,
+        )
+        print(json.dumps({
+            "event": "x402_settlement",
+            "transport": "mcp",
+            "transaction": transaction,
+            "endpoint": endpoint,
+            "amount_atomic": amount_atomic,
+            "amount_usdc": amount_atomic / 1_000_000,
+            "payer": payer,
+            "network": network,
+            "facilitator": X402_FACILITATOR,
+        }, default=str))
 
-    x402scan_task = asyncio.create_task(_register_x402scan_origin())
-    _background_tasks.add(x402scan_task)
-    x402scan_task.add_done_callback(_background_tasks.discard)
-
-    task = asyncio.create_task(_outcome_backfill_loop())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    yield
-    task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    await _x402_facilitator_client.aclose()
+        async with AsyncExitStack() as stack:
+            if _x402_ready:
+                try:
+                    mcp_server, mcp_asgi = build_cipher_mcp(
+                        resource_server=_x402_resource_server,
+                        requirements_for_price=_get_x402_requirements,
+                        public_base_url=PUBLIC_BASE_URL,
+                        settlement_recorder=record_mcp_settlement,
+                    )
+                    _mcp_bridge.set_app(mcp_asgi)
+                    await stack.enter_async_context(mcp_server.session_manager.run())
+                    print(json.dumps({
+                        "event": "cipher_mcp_startup",
+                        "ready": True,
+                        "url": f"{PUBLIC_BASE_URL}/mcp/",
+                    }))
+                except Exception as exc:
+                    print(json.dumps({
+                        "event": "cipher_mcp_startup",
+                        "ready": False,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:500],
+                    }))
+
+            registration_task = asyncio.create_task(_register_agent402_origin())
+            _background_tasks.add(registration_task)
+            registration_task.add_done_callback(_background_tasks.discard)
+
+            x402scan_task = asyncio.create_task(_register_x402scan_origin())
+            _background_tasks.add(x402scan_task)
+            x402scan_task.add_done_callback(_background_tasks.discard)
+
+            task = asyncio.create_task(_outcome_backfill_loop())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            try:
+                yield
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+    finally:
+        await _x402_facilitator_client.aclose()
 
 
 async def _register_agent402_origin() -> None:
@@ -702,8 +758,11 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
-    expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE"],
+    expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "Mcp-Session-Id"],
 )
+
+# Paid Streamable-HTTP MCP bridge; delegates only after shared x402 startup succeeds.
+app.mount("/mcp", _mcp_bridge, name="cipher-mcp")
 
 @app.middleware("http")
 async def settle_verified_x402(request: Request, call_next):
@@ -2030,6 +2089,12 @@ async def health():
             "network": SOLANA_NETWORK,
         },
         "revenue_settlements": _payment_stats()["settlements"],
+        "mcp": {
+            "ready": _mcp_bridge.ready,
+            "url": f"{PUBLIC_BASE_URL}/mcp/",
+            "transport": "streamable-http",
+            "paid_tools": 8,
+        },
     }
 
 
