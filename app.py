@@ -87,6 +87,9 @@ PRICES = {
     "tool_defi": 3000,        # $0.003
     "tool_pdf": 5000,         # $0.005
     "tool_repo": 10000,       # $0.01
+    "tool_mcp_audit": 10000,  # $0.01
+    "tool_x402_audit": 10000, # $0.01
+    "tool_payment_policy": 1000, # $0.001
 }
 
 
@@ -97,6 +100,9 @@ def _paid_endpoint_catalog() -> list[dict[str, Any]]:
         ("/tools/defi/yields", "GET", "Filter current DeFi yield pools by chain, token, TVL, APY, or stablecoin flag", "tool_defi"),
         ("/tools/defi/protocols", "GET", "Rank and filter DeFi protocols by chain, category, and TVL", "tool_defi"),
         ("/tools/repo/preflight", "GET", "Preflight a public GitHub repository for maintenance, license, CI, security-policy, and integration-risk signals", "tool_repo"),
+        ("/tools/mcp/audit", "POST", "Live MCP initialize/tools-list audit with tool fingerprinting and heuristic poisoning/change signals", "tool_mcp_audit"),
+        ("/tools/x402/audit", "POST", "Cold-probe an x402 endpoint for valid 402 challenges and discovery/OpenAPI consistency without paying", "tool_x402_audit"),
+        ("/tools/payment/policy", "POST", "Deterministic pre-payment firewall for budget, chain, asset, recipient, origin, and timeout policy", "tool_payment_policy"),
         ("/tools/url/read", "POST", "Convert a public HTML or text URL into compact agent-readable Markdown plus links", "tool_url"),
         ("/tools/pdf/markdown", "POST", "Extract a public PDF text layer into page-structured Markdown", "tool_pdf"),
         ("/tools/json/repair", "POST", "Repair common malformed LLM JSON without another model call", "tool_json"),
@@ -1153,6 +1159,86 @@ async def tool_transform(request: Request):
         return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
+@app.post("/tools/mcp/audit")
+async def tool_mcp_audit(request: Request):
+    block = await _gate(request, request.url.path, "tool_mcp_audit")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
+        return JSONResponse(status_code=400, content={"error": "url is required"})
+    try:
+        from agent_infra_tools import audit_mcp_server
+        from agent_tools import ToolError
+        return await audit_mcp_server(
+            payload["url"],
+            previous_fingerprint=payload.get("previous_fingerprint"),
+            timeout_seconds=float(payload.get("timeout_seconds", 12.0)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "invalid timeout_seconds"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/x402/audit")
+async def tool_x402_audit(request: Request):
+    block = await _gate(request, request.url.path, "tool_x402_audit")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
+        return JSONResponse(status_code=400, content={"error": "url is required"})
+    try:
+        from agent_infra_tools import audit_x402_endpoint
+        from agent_tools import ToolError
+        body = payload.get("body")
+        if body is not None and not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"error": "body must be a JSON object"})
+        return await audit_x402_endpoint(
+            payload["url"],
+            method=str(payload.get("method") or "auto"),
+            body=body,
+            timeout_seconds=float(payload.get("timeout_seconds", 12.0)),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "invalid timeout_seconds"})
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
+@app.post("/tools/payment/policy")
+async def tool_payment_policy(request: Request):
+    block = await _gate(request, request.url.path, "tool_payment_policy")
+    if block:
+        return block
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "valid JSON body is required"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON object body is required"})
+    challenge = payload.get("challenge")
+    policy = payload.get("policy")
+    if not isinstance(challenge, dict) or not isinstance(policy, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "challenge and policy must be JSON objects"},
+        )
+    try:
+        from agent_infra_tools import evaluate_payment_policy
+        from agent_tools import ToolError
+        return evaluate_payment_policy(challenge, policy)
+    except ToolError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+
 @app.post("/tools/json/repair")
 async def tool_json_repair(request: Request):
     block = await _gate(request, request.url.path, "tool_json")
@@ -1675,6 +1761,50 @@ def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
                 }
             },
             "required": ["text"],
+            "additionalProperties": False,
+        },
+        "/tools/mcp/audit": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri", "example": "https://example.com/mcp"},
+                "previous_fingerprint": {"type": "string", "description": "Optional prior SHA-256 tool fingerprint for change detection."},
+                "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        "/tools/x402/audit": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri", "example": "https://example.com/paid-tool"},
+                "method": {"type": "string", "enum": ["auto", "GET", "POST", "PUT", "PATCH", "DELETE"], "default": "auto"},
+                "body": {"type": "object", "description": "Optional JSON body used for POST/PUT/PATCH cold probes."},
+                "timeout_seconds": {"type": "number", "minimum": 3, "maximum": 30, "default": 12},
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        "/tools/payment/policy": {
+            "type": "object",
+            "properties": {
+                "challenge": {"type": "object", "description": "x402 PaymentRequired payload or one payment requirement object."},
+                "policy": {
+                    "type": "object",
+                    "properties": {
+                        "max_amount_usdc": {"type": "number"},
+                        "max_amount_atomic": {"type": "integer"},
+                        "allowed_networks": {"type": "array", "items": {"type": "string"}},
+                        "allowed_assets": {"type": "array", "items": {"type": "string"}},
+                        "allowed_pay_to": {"type": "array", "items": {"type": "string"}},
+                        "allowed_schemes": {"type": "array", "items": {"type": "string"}},
+                        "allowed_origins": {"type": "array", "items": {"type": "string"}},
+                        "expected_pay_to": {"type": "string"},
+                        "max_timeout_seconds": {"type": "integer"},
+                        "require_https_resource": {"type": "boolean", "default": true},
+                    },
+                },
+            },
+            "required": ["challenge", "policy"],
             "additionalProperties": False,
         },
         "/tools/transform": {
