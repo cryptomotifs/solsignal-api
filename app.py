@@ -1800,7 +1800,7 @@ def _openapi_request_body_schema(path: str) -> dict[str, Any] | None:
                         "allowed_origins": {"type": "array", "items": {"type": "string"}},
                         "expected_pay_to": {"type": "string"},
                         "max_timeout_seconds": {"type": "integer"},
-                        "require_https_resource": {"type": "boolean", "default": true},
+                        "require_https_resource": {"type": "boolean", "default": True},
                     },
                 },
             },
