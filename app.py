@@ -28,6 +28,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from x402.extensions.bazaar import declare_discovery_extension
 from x402.http import (
     FacilitatorConfig,
     HTTPFacilitatorClient,
@@ -73,6 +74,175 @@ PRICES = {
     "tool_pdf": 5000,         # $0.005
     "tool_repo": 10000,       # $0.01
 }
+
+
+def _paid_endpoint_catalog() -> list[dict[str, Any]]:
+    """Canonical machine-readable catalog used by discovery surfaces."""
+    specs = [
+        ("/tools/x402/ping", "GET", "Low-cost end-to-end x402 payment-path check", "tool_ping"),
+        ("/tools/defi/yields", "GET", "Filter current DeFi yield pools by chain, token, TVL, APY, or stablecoin flag", "tool_defi"),
+        ("/tools/defi/protocols", "GET", "Rank and filter DeFi protocols by chain, category, and TVL", "tool_defi"),
+        ("/tools/repo/preflight", "GET", "Preflight a public GitHub repository for maintenance, license, CI, security-policy, and integration-risk signals", "tool_repo"),
+        ("/tools/url/read", "POST", "Convert a public HTML or text URL into compact agent-readable Markdown plus links", "tool_url"),
+        ("/tools/pdf/markdown", "POST", "Extract a public PDF text layer into page-structured Markdown", "tool_pdf"),
+        ("/tools/json/repair", "POST", "Repair common malformed LLM JSON without another model call", "tool_json"),
+        ("/tools/transform", "POST", "Hash, Base64/hex/URL encode-decode, or decode JWT header and payload", "tool_transform"),
+        ("/scan/{mint}", "GET", "Solana token safety scan using multiple independent data sources", "scan"),
+        ("/trending", "GET", "Safety-screened trending Solana tokens", "trending"),
+        ("/signals/live/{mint}", "GET", "Experimental real-time multi-agent token scoring", "analysis"),
+        ("/signals/trending", "GET", "Legacy top-performing signal agents and latest snapshots", "trending"),
+        ("/signals/agent/{agent_name}", "GET", "Legacy scores from a specific calibrated signal agent", "agent"),
+        ("/signals/analysis/{mint}", "GET", "Legacy full multi-agent consensus analysis", "analysis"),
+        ("/signals/bulk", "GET", "Legacy bulk recent signal scores", "bulk"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for path, method, description, price_key in specs:
+        amount = int(PRICES[price_key])
+        rows.append({
+            "path": path,
+            "route": path,
+            "url": f"{PUBLIC_BASE_URL}{path}",
+            "method": method,
+            "description": description,
+            "price_key": price_key,
+            "amount": str(amount),
+            "price_usdc": amount / 1_000_000,
+            "priceUsd": f"${amount / 1_000_000:g}",
+            "currency": "USDC",
+            "network": SOLANA_NETWORK,
+            "asset": USDC_MINT,
+            "payTo": SOLANA_WALLET or None,
+        })
+    return rows
+
+
+def _match_discovery_endpoint(resource: str, price_key: str) -> dict[str, Any] | None:
+    path = resource.split("?", 1)[0]
+    for item in _paid_endpoint_catalog():
+        template = item["path"]
+        if "{" not in template:
+            if path == template:
+                return item
+            continue
+        prefix = template.split("{", 1)[0]
+        suffix = template.split("}", 1)[1]
+        if path.startswith(prefix) and path.endswith(suffix):
+            return item
+    for item in _paid_endpoint_catalog():
+        if item["price_key"] == price_key:
+            return item
+    return None
+
+
+def _bazaar_extensions(resource: str, price_key: str) -> dict[str, Any]:
+    """Declare how an autonomous buyer should call this paid HTTP resource."""
+    item = _match_discovery_endpoint(resource, price_key)
+    method = item["method"] if item else "GET"
+    path = resource.split("?", 1)[0]
+
+    input_example: dict[str, Any] | None = None
+    input_schema: dict[str, Any] | None = None
+    path_schema: dict[str, Any] | None = None
+    path_params: dict[str, str] = {}
+    route_template: str | None = None
+
+    if item:
+        template = item["path"]
+        if template == "/tools/repo/preflight":
+            input_example = {"repo": "openai/openai-agents-python"}
+            input_schema = {
+                "properties": {"repo": {"type": "string"}},
+                "required": ["repo"],
+            }
+        elif template == "/tools/defi/yields":
+            input_example = {"chain": "Solana", "limit": 20}
+            input_schema = {
+                "properties": {
+                    "chain": {"type": "string"},
+                    "token": {"type": "string"},
+                    "min_tvl": {"type": "number"},
+                    "min_apy": {"type": "number"},
+                    "stablecoin_only": {"type": "boolean"},
+                    "limit": {"type": "integer"},
+                }
+            }
+        elif template == "/tools/defi/protocols":
+            input_example = {"chain": "Solana", "limit": 20}
+            input_schema = {
+                "properties": {
+                    "chain": {"type": "string"},
+                    "category": {"type": "string"},
+                    "min_tvl": {"type": "number"},
+                    "limit": {"type": "integer"},
+                }
+            }
+        elif template == "/tools/url/read":
+            input_example = {"url": "https://example.com"}
+            input_schema = {
+                "properties": {
+                    "url": {"type": "string", "format": "uri"},
+                    "max_chars": {"type": "integer"},
+                },
+                "required": ["url"],
+            }
+        elif template == "/tools/pdf/markdown":
+            input_example = {"url": "https://example.com/document.pdf"}
+            input_schema = {
+                "properties": {
+                    "url": {"type": "string", "format": "uri"},
+                    "max_pages": {"type": "integer"},
+                    "max_chars": {"type": "integer"},
+                },
+                "required": ["url"],
+            }
+        elif template == "/tools/json/repair":
+            input_example = {"text": "{'status':'ok',}"}
+            input_schema = {
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            }
+        elif template == "/tools/transform":
+            input_example = {"operation": "sha256", "value": "hello"}
+            input_schema = {
+                "properties": {
+                    "operation": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["operation", "value"],
+            }
+
+        if "{" in template:
+            param = template.split("{", 1)[1].split("}", 1)[0]
+            prefix = template.split("{", 1)[0]
+            suffix = template.split("}", 1)[1]
+            value = path[len(prefix):]
+            if suffix and value.endswith(suffix):
+                value = value[:-len(suffix)]
+            path_schema = {
+                "properties": {param: {"type": "string"}},
+                "required": [param],
+            }
+            path_params[param] = value
+            route_template = template.replace("{" + param + "}", ":" + param)
+
+    declared = declare_discovery_extension(
+        input=input_example,
+        input_schema=input_schema,
+        path_params_schema=path_schema,
+        body_type="json" if method in {"POST", "PUT", "PATCH"} else None,
+    )
+    bazaar = declared.get("bazaar")
+    if isinstance(bazaar, dict):
+        info = bazaar.setdefault("info", {})
+        if isinstance(info, dict):
+            inp = info.setdefault("input", {})
+            if isinstance(inp, dict):
+                inp["method"] = method
+                if path_params:
+                    inp["pathParams"] = path_params
+        if route_template:
+            bazaar["routeTemplate"] = route_template
+    return declared
 
 PAYMENTS_DB = os.path.join(DATA_DIR, "payments.db")
 
@@ -452,6 +622,7 @@ async def _build_402(resource: str, price_key: str) -> Response:
             tags=["solana", "token-safety", "crypto"],
         ),
         error="Payment required",
+        extensions=_bazaar_extensions(resource, price_key),
     )
     payload = payment_required.model_dump(by_alias=True, exclude_none=True)
     return JSONResponse(
@@ -682,56 +853,23 @@ async def track_token(mint: str):
 @app.get("/tools/catalog")
 async def tools_catalog():
     """Free machine-readable catalog of CIPHER agent utilities."""
+    tools = []
+    for item in _paid_endpoint_catalog():
+        if not item["path"].startswith("/tools/"):
+            continue
+        tools.append({
+            "path": item["path"],
+            "method": item["method"],
+            "price_usdc": item["price_usdc"],
+            "description": item["description"],
+            "network": item["network"],
+            "asset": item["asset"],
+        })
     return {
         "name": "CIPHER Agent Tools",
         "payment": "x402 v2 / USDC on Solana",
         "recipient": SOLANA_WALLET or None,
-        "tools": [
-            {
-                "path": "/tools/x402/ping",
-                "method": "GET",
-                "price_usdc": 0.001,
-                "use_case": "Low-cost end-to-end x402 payment-path check; successful responses carry PAYMENT-RESPONSE settlement proof.",
-            },
-            {
-                "path": "/tools/defi/yields",
-                "method": "GET",
-                "price_usdc": 0.003,
-                "use_case": "Filter current DeFi yield pools by chain, token, TVL, APY, or stablecoin flag.",
-                "upstream": "DefiLlama public API",
-            },
-            {
-                "path": "/tools/defi/protocols",
-                "method": "GET",
-                "price_usdc": 0.003,
-                "use_case": "Rank/filter DeFi protocols by chain, category, and TVL.",
-                "upstream": "DefiLlama public API",
-            },
-            {
-                "path": "/tools/repo/preflight",
-                "method": "GET",
-                "price_usdc": 0.01,
-                "use_case": "Preflight a public GitHub repo for maintenance, license, CI, security policy, and integration risk.",
-            },
-            {
-                "path": "/tools/url/read",
-                "method": "POST",
-                "price_usdc": 0.003,
-                "use_case": "Turn a public HTML/text URL into compact agent-readable markdown plus links.",
-            },
-            {
-                "path": "/tools/pdf/markdown",
-                "method": "POST",
-                "price_usdc": 0.005,
-                "use_case": "Extract the text layer of a public PDF into page-structured markdown.",
-            },
-            {
-                "path": "/tools/json/repair",
-                "method": "POST",
-                "price_usdc": 0.001,
-                "use_case": "Repair common malformed LLM JSON without another model call.",
-            },
-        ],
+        "tools": tools,
     }
 
 
@@ -1258,170 +1396,41 @@ async def live_score(request: Request, mint: str, top_n: int = 20):
 # AUTO-DISCOVERY ENDPOINTS
 # =========================================================================
 
-@app.get("/.well-known/x402")
-async def x402_compat_manifest():
-    """Compatibility discovery document for x402 registries/crawlers."""
-    base = PUBLIC_BASE_URL
+def _x402_manifest_payload() -> dict[str, Any]:
+    endpoints = _paid_endpoint_catalog()
     return {
         "version": 1,
-        "resources": [
-            f"{base}/tools/x402/ping",
-            f"{base}/tools/defi/yields",
-            f"{base}/tools/defi/protocols",
-            f"{base}/tools/repo/preflight",
-            f"{base}/tools/url/read",
-            f"{base}/tools/pdf/markdown",
-            f"{base}/tools/json/repair",
-            f"{base}/tools/transform",
-            f"{base}/scan/{{mint}}",
-        ],
-    }
-
-
-@app.get("/.well-known/x402.json")
-async def x402_manifest():
-    """x402 service discovery — crawlers and AI agents find payable endpoints here."""
-    return {
         "x402Version": 2,
-        "name": "SolSignal API",
+        "name": "CIPHER Agent Tools",
         "description": (
-            "Machine-payable utilities for AI agents: DeFi data, GitHub repo preflight, "
-            "URL/PDF extraction, JSON repair, plus SolSignal token safety."
+            "Machine-payable utilities for AI agents: developer preflight, web/document "
+            "context extraction, deterministic transforms, DeFi data, and Solana token safety."
         ),
+        "origin": PUBLIC_BASE_URL,
         "homepage": "https://github.com/cryptomotifs/solsignal-api",
         "network": SOLANA_NETWORK,
         "asset": USDC_MINT,
         "payTo": SOLANA_WALLET or "not_configured",
         "facilitator": X402_FACILITATOR,
-        "endpoints": [
-            {
-                "path": "/tools/x402/ping",
-                "method": "GET",
-                "description": "Low-cost x402 payment-path check",
-                "amount": str(PRICES["tool_ping"]),
-                "currency": "USDC",
-                "priceUsd": "$0.001",
-            },
-            {
-                "path": "/scan/{mint}",
-                "method": "GET",
-                "description": "Token safety scan — 4 sources, 1 verdict (10 free/day)",
-                "amount": str(PRICES["scan"]),
-                "currency": "USDC",
-                "priceUsd": "$0.01",
-            },
-            {
-                "path": "/trending",
-                "method": "GET",
-                "description": "Safety-screened trending Solana tokens (3 free/day)",
-                "amount": str(PRICES["trending"]),
-                "currency": "USDC",
-                "priceUsd": "$0.01",
-            },
-            {
-                "path": "/signals/live/{mint}",
-                "method": "GET",
-                "description": "Experimental: Real-time 646-agent scoring",
-                "amount": str(PRICES["analysis"]),
-                "currency": "USDC",
-                "priceUsd": "$0.05",
-            },
-            {
-                "path": "/signals/trending",
-                "method": "GET",
-                "description": "Legacy: Top-performing agents and latest snapshots",
-                "amount": str(PRICES["trending"]),
-                "currency": "USDC",
-                "priceUsd": "$0.01",
-            },
-            {
-                "path": "/signals/agent/{agent_name}",
-                "method": "GET",
-                "description": "Legacy: Scores from a specific calibrated agent",
-                "amount": str(PRICES["agent"]),
-                "currency": "USDC",
-                "priceUsd": "$0.005",
-            },
-            {
-                "path": "/signals/analysis/{mint}",
-                "method": "GET",
-                "description": "Legacy: Full multi-agent consensus analysis",
-                "amount": str(PRICES["analysis"]),
-                "currency": "USDC",
-                "priceUsd": "$0.05",
-            },
-            {
-                "path": "/signals/bulk",
-                "method": "GET",
-                "description": "Legacy: All scores from top 50 agents for recent tokens",
-                "amount": str(PRICES["bulk"]),
-                "currency": "USDC",
-                "priceUsd": "$0.10",
-            },
-            {
-                "path": "/tools/defi/yields",
-                "method": "GET",
-                "description": "Filter normalized current DeFi yield pools",
-                "amount": str(PRICES["tool_defi"]),
-                "currency": "USDC",
-                "priceUsd": "$0.003",
-            },
-            {
-                "path": "/tools/defi/protocols",
-                "method": "GET",
-                "description": "Filter normalized DeFi protocol/TVL data",
-                "amount": str(PRICES["tool_defi"]),
-                "currency": "USDC",
-                "priceUsd": "$0.003",
-            },
-            {
-                "path": "/tools/repo/preflight",
-                "method": "GET",
-                "description": "GitHub repo maintenance/license/integration preflight",
-                "amount": str(PRICES["tool_repo"]),
-                "currency": "USDC",
-                "priceUsd": "$0.01",
-            },
-            {
-                "path": "/tools/url/read",
-                "method": "POST",
-                "description": "Public URL to compact agent-readable markdown",
-                "amount": str(PRICES["tool_url"]),
-                "currency": "USDC",
-                "priceUsd": "$0.003",
-            },
-            {
-                "path": "/tools/pdf/markdown",
-                "method": "POST",
-                "description": "Public PDF text-layer extraction to markdown",
-                "amount": str(PRICES["tool_pdf"]),
-                "currency": "USDC",
-                "priceUsd": "$0.005",
-            },
-            {
-                "path": "/tools/json/repair",
-                "method": "POST",
-                "description": "Repair common malformed LLM JSON",
-                "amount": str(PRICES["tool_json"]),
-                "currency": "USDC",
-                "priceUsd": "$0.001",
-            },
-            {
-                "path": "/tools/transform",
-                "method": "POST",
-                "description": "Hash, Base64/hex/URL encode-decode, and decode JWT payloads",
-                "amount": str(PRICES["tool_transform"]),
-                "currency": "USDC",
-                "priceUsd": "$0.001",
-            },
+        "resources": endpoints,
+        "endpoints": endpoints,
+        "freeEndpoints": [
+            "/", "/health", "/agents", "/track/stats", "/track/{mint}",
+            "/tools/catalog", "/skill.md", "/llms.txt", "/docs",
         ],
-        "freeEndpoints": ["/", "/health", "/agents", "/track/stats", "/track/{mint}", "/tools/catalog", "/skill.md", "/llms.txt", "/docs"],
-        "token": {
-            "name": "Sol Signal AI",
-            "symbol": "SSAI",
-            "mint": "4KQnaEvCWp315CrVTvjUG7osfj2uAVCMpT5GhRQ7pump",
-        },
     }
+
+
+@app.get("/.well-known/x402")
+async def x402_compat_manifest():
+    """Full crawler-friendly x402 discovery document."""
+    return _x402_manifest_payload()
+
+
+@app.get("/.well-known/x402.json")
+async def x402_manifest():
+    """Detailed x402 service discovery document."""
+    return _x402_manifest_payload()
 
 
 @app.get("/.well-known/ai-plugin.json")
