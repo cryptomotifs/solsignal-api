@@ -50,7 +50,7 @@ async def test_priority_fee_summary(monkeypatch) -> None:
     assert result["summary"]["median_nonzero"] == 3000
     assert result["summary"]["p75_nonzero"] == 3000
     assert result["summary"]["p90_nonzero"] == 4000
-    assert result["maximum"] == 4000
+    assert result["summary"]["maximum"] == 4000
     assert result["sample_count"] == 5
 
 
