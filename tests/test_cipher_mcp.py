@@ -68,8 +68,8 @@ def test_build_paid_mcp_with_pinned_sdk_registers_all_prices() -> None:
             network="solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
             asset="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             amount="1000",
-            payTo="HDJ88KsVwUGxGZmEdKtgMxHvssZR4gfFp1v1izCPK5x9",
-            maxTimeoutSeconds=60,
+            pay_to="HDJ88KsVwUGxGZmEdKtgMxHvssZR4gfFp1v1izCPK5x9",
+            max_timeout_seconds=60,
         )
 
     def recorder(**kwargs):
