@@ -18,3 +18,5 @@ jobs:
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: python -m py_compile app.py scanner.py scoring.py tracker.py agent_tools.py agent_infra_tools.py solana_tools.py
       - run: PYTHONPATH=. pytest -q
+      - run: docker build -t cipher-agent-tools-ci .
+      - run: docker run --rm cipher-agent-tools-ci python -c "import app, agent_tools, agent_infra_tools, solana_tools"
