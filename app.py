@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
-from x402.extensions.bazaar import declare_discovery_extension
+from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 from x402.http import (
     FacilitatorConfig,
     HTTPFacilitatorClient,
@@ -188,6 +188,65 @@ def _match_discovery_endpoint(resource: str, price_key: str) -> dict[str, Any] |
         if item["price_key"] == price_key:
             return item
     return None
+
+
+def _bazaar_output_config(template: str | None) -> OutputConfig | None:
+    """Representative machine-readable outputs so buyer agents can judge usefulness."""
+    examples: dict[str, dict[str, Any]] = {
+        "/tools/x402/ping": {"ok": True, "payment_path": "settled"},
+        "/tools/defi/yields": {"count": 1, "pools": [{"chain": "Solana", "apy": 5.2, "tvl_usd": 1000000}]},
+        "/tools/defi/protocols": {"count": 1, "protocols": [{"name": "Example", "chain": "Solana", "tvl_usd": 1000000}]},
+        "/tools/repo/preflight": {"repository": "owner/repo", "recommendation": "ADAPT_AFTER_TECHNICAL_REVIEW", "risk_flags": []},
+        "/tools/mcp/audit": {"status": "HEALTHY", "speaks_mcp": True, "tools_count": 8, "tool_fingerprint_sha256": "…"},
+        "/tools/x402/audit": {"status": "PASS", "paid_method": "POST", "well_known_manifest_found": True, "findings": []},
+        "/tools/payment/policy": {"approved": True, "decision": "APPROVE", "violations": []},
+        "/tools/mcp/bulk": {"total": 2, "results": [{"status": "HEALTHY"}]},
+        "/tools/x402/bulk": {"total": 2, "results": [{"status": "PASS"}]},
+        "/tools/agent/adoption-preflight": {"decision": "ADOPT_WITH_REVIEW", "evidence": {}},
+        "/tools/mcp/registry-doctor": {"status": "PASS", "findings": []},
+        "/tools/mcp/oauth-doctor": {"status": "PASS", "resource_metadata_url": "https://example.com/.well-known/oauth-protected-resource"},
+        "/tools/x402/prepay-verify": {"approved": True, "decision": "APPROVE", "challenge_consistent": True},
+        "/tools/solana/chain": {"network": "solana-mainnet", "slot": 123456, "block_height": 120000, "epoch": 900},
+        "/tools/solana/wallet": {"address": "…", "sol": {"amount": "1.2"}, "usdc": {"amount": "10.5"}},
+        "/tools/solana/token-balance": {"owner": "…", "mint": "…", "ui_amount": "10.5", "token_account_count": 1},
+        "/tools/solana/tx-verify": {"confirmed": True, "transaction_success": True, "verified": True, "recipient_credit_usdc": "0.005"},
+        "/tools/solana/blockhash": {"network": "solana-mainnet", "blockhash": "…", "last_valid_block_height": 123456},
+        "/tools/solana/priority-fees": {"sample_count": 50, "summary": {"median_nonzero": 1000, "p90_nonzero": 5000, "maximum": 10000}},
+        "/tools/solana/rent": {"data_len": 165, "lamports": 2039280, "sol": "0.00203928"},
+        "/tools/solana/account": {"address": "…", "exists": True, "owner_program": "…", "space_bytes": 165},
+        "/tools/solana/message-fee": {"fee_lamports": 5000, "fee_sol": "0.000005"},
+        "/tools/solana/tx-status": {"found": True, "success": True, "confirmation_status": "finalized", "finalized": True},
+        "/tools/solana/simulate": {"simulation_success": True, "units_consumed": 125000, "fee_lamports": 5000, "broadcast": False},
+        "/tools/solana/tx-forensics": {"success": True, "confirmation_status": "confirmed", "fee_lamports": 5000, "programs": ["system"], "instruction_count": 2},
+        "/tools/url/read": {"url": "https://example.com", "title": "Example", "markdown": "# Example\n…"},
+        "/tools/pdf/markdown": {"url": "https://example.com/document.pdf", "pages": 3, "markdown": "# Page 1\n…"},
+        "/tools/json/repair": {"valid": True, "json": {"status": "ok"}},
+        "/tools/transform": {"operation": "sha256", "result": "2cf24dba…"},
+    }
+    example = examples.get(template or "")
+    if example is None:
+        return None
+    return OutputConfig(example=example, schema={"type": "object"})
+
+
+def _catalog_tags(item: dict[str, Any] | None) -> list[str]:
+    tags = ["ai-agents", "x402", "machine-payable"]
+    path = str((item or {}).get("path") or "")
+    if path.startswith("/tools/solana/") or path.startswith("/scan/") or path.startswith("/signals/"):
+        tags += ["solana", "blockchain"]
+    elif path.startswith("/tools/mcp/"):
+        tags += ["mcp", "developer-tools"]
+    elif path.startswith("/tools/x402/") or path.startswith("/tools/payment/"):
+        tags += ["payments", "x402-security"]
+    elif path.startswith("/tools/defi/"):
+        tags += ["defi", "market-data"]
+    elif path.startswith("/tools/repo/") or path.startswith("/tools/agent/"):
+        tags += ["developer-tools", "integration"]
+    elif path.startswith("/tools/url/") or path.startswith("/tools/pdf/"):
+        tags += ["document-processing", "context"]
+    else:
+        tags += ["developer-tools"]
+    return list(dict.fromkeys(tags))
 
 
 def _bazaar_extensions(resource: str, price_key: str) -> dict[str, Any]:
@@ -412,6 +471,7 @@ def _bazaar_extensions(resource: str, price_key: str) -> dict[str, Any]:
         input_schema=input_schema,
         path_params_schema=path_schema,
         body_type="json" if method in {"POST", "PUT", "PATCH"} else None,
+        output=_bazaar_output_config(item["path"] if item else None),
     )
     bazaar = declared.get("bazaar")
     if isinstance(bazaar, dict):
@@ -902,14 +962,20 @@ async def _build_402(resource: str, price_key: str) -> Response:
         )
 
     requirements = _get_x402_requirements(price_key)
+    catalog_item = _match_discovery_endpoint(resource, price_key)
+    resource_description = (
+        catalog_item["description"]
+        if catalog_item
+        else "Low-cost machine-payable API for autonomous agents"
+    )
     payment_required = await _x402_resource_server.create_payment_required_response(
         [requirements],
         resource=ResourceInfo(
             url=f"{PUBLIC_BASE_URL}{resource}",
-            description=f"SolSignal paid API: {price_key}",
+            description=resource_description,
             mime_type="application/json",
             service_name="CIPHER Agent Tools",
-            tags=["solana", "token-safety", "crypto"],
+            tags=_catalog_tags(catalog_item),
         ),
         error="Payment required",
         extensions=_bazaar_extensions(resource, price_key),
@@ -1845,10 +1911,20 @@ async def tool_json_repair(request: Request):
 
 @app.get("/skill.md")
 async def skill_md():
-    """Agent-facing contract for CIPHER Agent Tools."""
+    """Agent-facing contract generated from the canonical paid-tool catalog."""
+    tools = _paid_endpoint_catalog()
+    rows = [
+        "| Tool | Method | Price | Purpose |",
+        "|---|---|---:|---|",
+    ]
+    for item in tools:
+        rows.append(
+            f"| `{item['path']}` | {item['method']} | {item['priceUsd']} | {item['description']} |"
+        )
+
     body = f"""---
 name: CIPHER Agent Tools
-description: Low-cost machine-payable utilities for AI agents: DeFi data, GitHub repo preflight, URL/PDF extraction, JSON repair, and Solana token safety.
+description: Machine-payable agent infrastructure for Solana, MCP, x402 payments, DeFi data, repository preflight, and deterministic developer utilities.
 base_url: {PUBLIC_BASE_URL}
 payment: x402 v2
 network: {SOLANA_NETWORK}
@@ -1858,95 +1934,65 @@ pay_to: {SOLANA_WALLET}
 
 # CIPHER Agent Tools
 
-Use these endpoints when your agent needs normalized data or deterministic utility work without spending model tokens.
+Use CIPHER when an autonomous agent needs deterministic infrastructure or public data without account signup or another LLM call.
 
-## Discovery
+## Free discovery
 
-- `GET /tools/catalog` — free machine-readable catalog.
-- `GET /openapi.json` — free OpenAPI schema.
-- `GET /.well-known/x402` — free x402 compatibility manifest.
+- `GET /tools/catalog` — canonical JSON catalog.
+- `GET /openapi.json` — OpenAPI including x402 prices and request schemas.
+- `GET /.well-known/x402` — crawler-friendly x402 manifest.
 - `GET /.well-known/x402.json` — detailed x402 manifest.
-- `GET /revenue` — settlement-backed public revenue counter.
+- `GET /llms.txt` — compact text catalog.
+- `GET /revenue` — confirmed-settlement accounting only.
 
-## Paid tools
+## Paid catalog
 
-| Tool | Method | Price | Use when |
-|---|---|---:|---|
-| `/tools/x402/ping` | GET | $0.001 | Prove the agent's x402 wallet/payment path works end to end. |
-| `/tools/defi/yields` | GET | $0.003 | Filter current DeFi yield pools by chain, token, TVL, APY, or stablecoin flag. |
-| `/tools/defi/protocols` | GET | $0.003 | Rank/filter protocols by chain, category, and TVL. |
-| `/tools/repo/preflight` | GET | $0.01 | Check a public GitHub repo's maintenance, license, CI, security policy, and integration-risk signals. |
-| `/tools/url/read` | POST | $0.003 | Convert a public HTML/text URL into compact agent-readable Markdown. |
-| `/tools/pdf/markdown` | POST | $0.005 | Extract a public PDF text layer into page-structured Markdown. |
-| `/tools/json/repair` | POST | $0.001 | Repair common malformed LLM JSON without another model call. |
-| `/tools/solana/chain` | GET | $0.001 | Read current Solana slot, block height, and epoch. |
-| `/tools/solana/wallet` | POST | $0.003 | Read SOL/USDC balances and recent signatures for a wallet. |
-| `/tools/solana/token-balance` | POST | $0.002 | Read an SPL token balance for an owner/mint pair. |
-| `/tools/solana/tx-verify` | POST | $0.005 | Verify confirmed USDC recipient balance deltas for a Solana transaction. |
-| `/tools/solana/tx-status` | POST | $0.001 | Check processed/confirmed/finalized transaction status and success. |
-| `/tools/solana/simulate` | POST | $0.005 | Simulate an unsigned or signed base64 transaction without broadcasting it. |
-| `/tools/solana/tx-forensics` | POST | $0.01 | Inspect programs, parsed instructions, balance deltas, logs, fee, and compute usage. |
-| `/tools/solana/blockhash` | GET | $0.001 | Get a fresh confirmed blockhash and last-valid block height. |
-| `/tools/solana/priority-fees` | POST | $0.002 | Read recent priority-fee samples and p50/p75/p90 non-zero prices. |
-| `/tools/solana/rent` | POST | $0.001 | Calculate rent-exempt lamports for an account data length. |
-| `/tools/solana/account` | POST | $0.001 | Read compact public account metadata. |
-| `/tools/solana/message-fee` | POST | $0.002 | Calculate fee for a base64 serialized message without submitting it. |
-| `/scan/{{mint}}` | GET | $0.01 after free quota | Screen a Solana token across multiple safety sources. |
+{chr(10).join(rows)}
 
-## Payment flow
+## Payment
 
-1. Call the endpoint normally.
-2. If payment is required, the service returns HTTP 402 with a `PAYMENT-REQUIRED` header.
-3. Sign/pay the advertised x402 v2 USDC requirement on Solana.
+1. Call the chosen endpoint normally.
+2. Read HTTP 402 and `PAYMENT-REQUIRED`.
+3. Pay the advertised x402 v2 USDC requirement on Solana.
 4. Retry with `PAYMENT-SIGNATURE`.
-5. On success, the response includes `PAYMENT-RESPONSE` with settlement details.
+5. A successful paid response includes `PAYMENT-RESPONSE`.
 
-Revenue is recorded only after a successful settlement with an on-chain transaction signature.
+Revenue is counted only after successful on-chain settlement with a non-empty transaction signature.
 
-## Spend guidance
+## Selection guidance
 
-- Prefer DeFi data endpoints over model-generated market summaries when raw normalized data is enough.
-- Use JSON repair before retrying an LLM call.
-- Use repo preflight before importing an unfamiliar public dependency.
-- Use URL/PDF extraction for public resources only.
-- DeFi APY data is observational, not a recommendation or guarantee.
-
-## Examples
-
-`GET {PUBLIC_BASE_URL}/tools/defi/yields?chain=Solana&min_tvl=1000000&limit=10`
-
-`GET {PUBLIC_BASE_URL}/tools/repo/preflight?repo=openai/openai-agents-python`
-
-`POST {PUBLIC_BASE_URL}/tools/json/repair`
-body: `{{"text":"{{'ok': true,}}"}}`
+- For Solana transaction construction, use blockhash, priority-fees, rent, account, and message-fee.
+- Before broadcasting a transaction, use simulate. After submission, use tx-status; for diagnosis, use tx-forensics.
+- Before an agent pays an unfamiliar x402 seller, use x402/audit plus x402/prepay-verify or payment/policy.
+- Before adopting an MCP server, use mcp/audit, oauth-doctor, or registry-doctor.
+- Use bulk audit endpoints when checking multiple MCP or x402 targets.
+- Use deterministic transform/JSON repair before spending model tokens on simple plumbing.
 """
     return Response(content=body, media_type="text/markdown; charset=utf-8")
 
 
 @app.get("/llms.txt")
 async def llms_txt():
-    content = """# CIPHER Agent Tools / SolSignal
-
-Machine-payable APIs for AI agents. Payment: x402 v2, USDC on Solana.
-
-Free discovery:
-- GET /tools/catalog
-- GET /docs
-- GET /.well-known/x402.json
-- GET /.well-known/agent.json
-- GET /revenue
-
-Paid tools:
-- GET /tools/x402/ping — $0.001
-- GET /tools/defi/yields — $0.003
-- GET /tools/defi/protocols — $0.003
-- GET /tools/repo/preflight — $0.01
-- POST /tools/url/read — $0.003
-- POST /tools/pdf/markdown — $0.005
-- POST /tools/json/repair — $0.001
-- GET /scan/{mint} — Solana token safety
-"""
-    return Response(content=content, media_type="text/plain; charset=utf-8")
+    """Compact always-current catalog for language-model and crawler consumption."""
+    lines = [
+        "# CIPHER Agent Tools",
+        "",
+        "Machine-payable deterministic APIs. x402 v2, USDC on Solana.",
+        f"Base URL: {PUBLIC_BASE_URL}",
+        f"Pay to: {SOLANA_WALLET}",
+        "",
+        "Free discovery: /tools/catalog /openapi.json /.well-known/x402 /.well-known/x402.json /skill.md /revenue",
+        "",
+        "Paid tools:",
+    ]
+    for item in _paid_endpoint_catalog():
+        lines.append(
+            f"- {item['method']} {item['path']} — {item['priceUsd']} — {item['description']}"
+        )
+    return Response(
+        content="\n".join(lines) + "\n",
+        media_type="text/plain; charset=utf-8",
+    )
 
 
 # =========================================================================
