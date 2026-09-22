@@ -39,6 +39,8 @@ from x402.mechanisms.svm.exact import ExactSvmServerScheme
 from x402.schemas import AssetAmount, ResourceConfig, ResourceInfo
 from x402.server import x402ResourceServer
 
+from payment_store import PaymentStore
+
 # --- Config ---
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 ARENA_DB = os.path.join(DATA_DIR, "arena_snapshots.db")
@@ -75,6 +77,8 @@ PRICES = {
 }
 
 PAYMENTS_DB = os.path.join(DATA_DIR, "payments.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_payment_store = PaymentStore(database_url=DATABASE_URL, sqlite_path=PAYMENTS_DB)
 
 _x402_facilitator_client = HTTPFacilitatorClient(
     FacilitatorConfig(url=X402_FACILITATOR)
@@ -308,27 +312,8 @@ def _deduct_credit(key: str):
 # --- x402 v2 + settlement-backed revenue ---
 
 def _init_payments_db() -> None:
-    """Create the settlement ledger used by the public revenue endpoint."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(PAYMENTS_DB)
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settlements (
-                tx_signature TEXT PRIMARY KEY,
-                endpoint TEXT NOT NULL,
-                amount_atomic INTEGER NOT NULL,
-                amount_usdc REAL NOT NULL,
-                payer TEXT,
-                network TEXT NOT NULL,
-                facilitator TEXT NOT NULL,
-                settled_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    """Initialize the settlement ledger (Postgres in production, SQLite locally)."""
+    _payment_store.initialize()
 
 
 def _record_settlement(
@@ -340,65 +325,19 @@ def _record_settlement(
     network: str,
 ) -> None:
     """Persist a confirmed on-chain settlement exactly once."""
-    if not transaction:
-        raise ValueError("A confirmed settlement must include a transaction signature")
-    _init_payments_db()
-    conn = sqlite3.connect(PAYMENTS_DB)
-    try:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO settlements
-            (tx_signature, endpoint, amount_atomic, amount_usdc, payer, network, facilitator, settled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                transaction,
-                endpoint,
-                int(amount_atomic),
-                int(amount_atomic) / 1_000_000,
-                payer,
-                network,
-                X402_FACILITATOR,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    _payment_store.record_settlement(
+        transaction=transaction,
+        endpoint=endpoint,
+        amount_atomic=amount_atomic,
+        payer=payer,
+        network=network,
+        facilitator=X402_FACILITATOR,
+    )
 
 
 def _payment_stats() -> dict[str, Any]:
     """Return revenue derived only from confirmed settlement receipts."""
-    _init_payments_db()
-    conn = sqlite3.connect(PAYMENTS_DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute(
-            "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_atomic), 0) AS total FROM settlements"
-        ).fetchone()
-        recent = []
-        recent_rows = conn.execute(
-            """
-            SELECT tx_signature, endpoint, amount_usdc, payer, network, facilitator, settled_at
-            FROM settlements
-            ORDER BY settled_at DESC
-            LIMIT 20
-            """
-        ).fetchall()
-        for r in recent_rows:
-            item = dict(r)
-            item["transaction"] = item.pop("tx_signature")
-            recent.append(item)
-    finally:
-        conn.close()
-
-    total_atomic = int(row["total"]) if row else 0
-    count = int(row["cnt"]) if row else 0
-    return {
-        "total_usdc": round(total_atomic / 1_000_000, 6),
-        "settlements": count,
-        "recent": recent,
-    }
+    return _payment_store.stats()
 
 
 def _get_x402_requirements(price_key: str):
@@ -1056,6 +995,10 @@ async def health():
             "network": SOLANA_NETWORK,
         },
         "revenue_settlements": _payment_stats()["settlements"],
+        "revenue_ledger": {
+            "backend": _payment_store.backend,
+            "durable": _payment_store.durable,
+        },
     }
 
 
